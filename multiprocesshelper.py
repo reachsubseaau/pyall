@@ -5,6 +5,8 @@ import ctypes
 import logging
 from datetime import datetime, timedelta
 
+REQUIRED_GB_PER_CPU = 4
+
 
 ###############################################################################
 def	log(msg, error = False, printmsg=True):
@@ -33,8 +35,7 @@ def getcpucount(requestedcpu):
 		requestedcpu = multiprocessing.cpu_count()
 		availablememoryingigs = get_available_memory_gb()
 		if availablememoryingigs is not None:
-			requiredgigspercpu = 4
-			maxcpu = max(1, int(availablememoryingigs / requiredgigspercpu))
+			maxcpu = max(1, int(availablememoryingigs / REQUIRED_GB_PER_CPU))
 			if requestedcpu > maxcpu:
 				requestedcpu = maxcpu
 
