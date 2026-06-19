@@ -71,7 +71,7 @@ def main():
 		matches = fileutils.findFiles2(False, runtime_params['inputfolder'], "*.all")
 
 	if len(matches) == 0:
-		log("No input .all files found, skipping.", error=True)
+		log("No input .all files found. Use -i <file-or-folder> or run in a folder containing .all files.", error=True)
 		return
 
 	#make sure we have a folder to write to
