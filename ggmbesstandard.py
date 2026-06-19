@@ -224,8 +224,6 @@ class standard:
 
 	###############################################################################
 	def	log(self, msg, error = False, printmsg=True):
-			if printmsg:
-				print (msg)
 			if error == False:
 				logging.info(msg)
 			else:
@@ -233,8 +231,6 @@ class standard:
 
 ###############################################################################
 def	log(msg, error = False, printmsg=True):
-		if printmsg:
-			print (msg)
 		if error == False:
 			logging.info(msg)
 		else:

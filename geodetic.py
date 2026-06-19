@@ -52,6 +52,7 @@ import numpy as np
 import sys
 import os.path
 import pyproj
+import logging
 
 ###############################################################################
 def main():
@@ -59,58 +60,58 @@ def main():
 	easting = 10
 	northing = 10
 	distance = 5
-	print(calculateGridPositionFromrangeBearing(easting, northing, distance, 0))
-	print(calculateGridPositionFromrangeBearing(easting, northing, distance, 90))
-	print(calculateGridPositionFromrangeBearing(easting, northing, distance, 180))
-	print(calculateGridPositionFromrangeBearing(easting, northing, distance, 270))
-	print(calculateGridPositionFromrangeBearing(easting, northing, distance, 360))
+	logging.info(calculateGridPositionFromrangeBearing(easting, northing, distance, 0))
+	logging.info(calculateGridPositionFromrangeBearing(easting, northing, distance, 90))
+	logging.info(calculateGridPositionFromrangeBearing(easting, northing, distance, 180))
+	logging.info(calculateGridPositionFromrangeBearing(easting, northing, distance, 270))
+	logging.info(calculateGridPositionFromrangeBearing(easting, northing, distance, 360))
 
 	f = 1.0 / 298.257223563		# WGS84
 	a = 6378137.0 			# metres
 
-	print  ("\n Ellipsoidal major axis =  %12.3f metres\n" % ( a ))
-	print  ("\n Inverse flattening	 =  %15.9f\n" % ( 1.0/f ))
+	logging.info("\n Ellipsoidal major axis =  %12.3f metres\n" % ( a ))
+	logging.info("\n Inverse flattening	 =  %15.9f\n" % ( 1.0/f ))
 
-	print ("\n Test Flinders Peak to Buninyon")
-	print ("\n ****************************** \n")
+	logging.info("\n Test Flinders Peak to Buninyon")
+	logging.info("\n ****************************** \n")
 	latitude1 = -(( 3.7203 / 60. + 57) / 60. + 37 )
 	longitude1 = ( 29.5244 / 60. + 25) / 60. + 144
-	print ("Flinders Peak = %12.6f, %13.6f \n" % ( latitude1, longitude1 ))
+	logging.info("Flinders Peak coordinates loaded")
 	deg = int(latitude1)
 	min = int(abs( ( latitude1 - deg) * 60.0 ))
 	sec = abs(latitude1 * 3600 - deg * 3600) - min * 60
-	print (" Flinders Peak =   %3i\xF8%3i\' %6.3f\",  " % ( deg, min, sec ),)
+	logging.info(" Flinders Peak =   %3i\xF8%3i\' %6.3f\",  " % ( deg, min, sec ))
 	deg = int(longitude1)
 	min = int(abs( ( longitude1 - deg) * 60.0 ))
 	sec = abs(longitude1 * 3600 - deg * 3600) - min * 60
-	print (" %3i\xF8%3i\' %6.3f\" \n" % ( deg, min, sec ))
+	logging.info(" %3i\xF8%3i\' %6.3f\" \n" % ( deg, min, sec ))
 
 	latitude2 = -(( 10.1561 / 60. + 39) / 60. + 37 )
 	longitude2 = ( 35.3839 / 60. + 55) / 60. + 143
-	print ("\n Buninyon	  = %12.6f, %13.6f \n" % ( latitude2, longitude2 ))
+	logging.info("\n Buninyon coordinates loaded\n")
 
 	deg = int(latitude2)
 	min = int(abs( ( latitude2 - deg) * 60.0 ))
 	sec = abs(latitude2 * 3600 - deg * 3600) - min * 60
-	print (" Buninyon	  =   %3i\xF8%3i\' %6.3f\",  " % ( deg, min, sec ),)
+	logging.info(" Buninyon	  =   %3i\xF8%3i\' %6.3f\",  " % ( deg, min, sec ))
 	deg = int(longitude2)
 	min = int(abs( ( longitude2 - deg) * 60.0 ))
 	sec = abs(longitude2 * 3600 - deg * 3600) - min * 60
-	print (" %3i\xF8%3i\' %6.3f\" \n" % ( deg, min, sec ))
+	logging.info(" %3i\xF8%3i\' %6.3f\" \n" % ( deg, min, sec ))
 
 	# dist, alpha1Tp2, alpha21   = vinc_dist  ( f, a, latitude1, longitude1, latitude2,  longitude2 )
 	dist, alpha1Tp2, alpha21 = calculaterangeBearingFromGeographicals(longitude1, latitude1,  longitude2,  latitude2 )
 
-	print ("\n Ellipsoidal Distance = %15.3f metres\n			should be		 54972.271 m\n" % ( dist ))
-	print ("\n Forward and back azimuths = %15.6f, %15.6f \n" % ( alpha1Tp2, alpha21 ))
+	logging.info("\n Ellipsoidal Distance = %15.3f metres\n			should be		 54972.271 m\n" % ( dist ))
+	logging.info("\n Forward and back azimuths = %15.6f, %15.6f \n" % ( alpha1Tp2, alpha21 ))
 	deg = int(alpha1Tp2)
 	min = int( abs(( alpha1Tp2 - deg) * 60.0 ) )
 	sec = abs(alpha1Tp2 * 3600 - deg * 3600) - min * 60
-	print (" Forward azimuth = %3i\xF8%3i\' %6.3f\"\n" % ( deg, min, sec ))
+	logging.info(" Forward azimuth = %3i\xF8%3i\' %6.3f\"\n" % ( deg, min, sec ))
 	deg = int(alpha21)
 	min = int(abs( ( alpha21 - deg) * 60.0 ))
 	sec = abs(alpha21 * 3600 - deg * 3600) - min * 60
-	print (" Reverse azimuth = %3i\xF8%3i\' %6.3f\"\n" % ( deg, min, sec ))
+	logging.info(" Reverse azimuth = %3i\xF8%3i\' %6.3f\"\n" % ( deg, min, sec ))
 
 	# Test the direct function */
 	latitude1 = -(( 3.7203 / 60. + 57) / 60. + 37 )
@@ -123,21 +124,21 @@ def main():
 	# latitude2, longitude2, alpha21 = vincentyDirect (latitude1, longitude1, alpha1Tp2, dist )
 	latitude2, longitude2, alpha21 = calculateGeographicalPositionFromrangeBearing(latitude1, longitude1, alpha1Tp2, dist)
 
-	print ("\n Projected point =%11.6f, %13.6f \n" % ( latitude2, longitude2 ))
+	logging.info("\n Projected point coordinates computed\n")
 	deg = int(latitude2)
 	min = int(abs( ( latitude2 - deg) * 60.0 ))
 	sec = abs( latitude2 * 3600 - deg * 3600) - min * 60
-	print (" Projected Point = %3i\xF8%3i\' %6.3f\", " % ( deg, min, sec ),)
+	logging.info(" Projected Point = %3i\xF8%3i\' %6.3f\", " % ( deg, min, sec ))
 	deg = int(longitude2)
 	min = int(abs( ( longitude2 - deg) * 60.0 ))
 	sec = abs(longitude2 * 3600 - deg * 3600) - min * 60
-	print ("  %3i\xF8%3i\' %6.3f\"\n" % ( deg, min, sec ))
-	print (" Should be Buninyon \n" )
-	print ("\n Reverse azimuth = %10.6f \n" % ( alpha21 ))
+	logging.info("  %3i\xF8%3i\' %6.3f\"\n" % ( deg, min, sec ))
+	logging.info(" Should be Buninyon \n" )
+	logging.info("\n Reverse azimuth computed\n")
 	deg = int(alpha21)
 	min = int(abs( ( alpha21 - deg) * 60.0 ))
 	sec = abs(alpha21 * 3600 - deg * 3600) - min * 60
-	print (" Reverse azimuth = %3i\xF8%3i\' %6.3f\"\n\n" % ( deg, min, sec ))
+	logging.info(" Reverse azimuth = %3i\xF8%3i\' %6.3f\"\n\n" % ( deg, min, sec ))
 
 ###############################################################################
 def epsgfromlonglat (longitude, latitude):
