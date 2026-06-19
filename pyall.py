@@ -167,7 +167,7 @@ def loaddata(filename, runtime_params):
     verbose = bool(_get_runtime_param(runtime_params, 'verbose', False))
     
     #get the record count so we can show a progress bar
-    recordcount, starttimestamp, enftimestamp = r.getrecordcount("X")
+    recordcount, starttimestamp, endtimestamp = r.getrecordcount("X")
 
     #we need to load the navigation to we can compute the position of the transducer at ping time...
     navigation = r.loadnavigation()
@@ -186,7 +186,7 @@ def loaddata(filename, runtime_params):
             datagram.latitude = tslatitude.getValueAt(datagram.timestamp)
             datagram.longitude = tslongitude.getValueAt(datagram.timestamp)
             if verbose:
-                print("%.5f, %.5f" % (datagram.latitude, datagram.longitude))
+                print("Processing ping %d" % (pingcounter + 1))
             x, y, z, q, id, beamcounter = computebathypointcloud(datagram, geo, beamcounter=beamcounter)
             pointcloud.add(x, y, z, q, id)
             update_progress("Extracting Point Cloud", pingcounter/recordcount)
