@@ -4,7 +4,7 @@ import fnmatch
 from glob import glob
 import shutil
 
-from ctypes import Structure, c_int32, c_uint64, sizeof, byref, windll
+from ctypes import Structure, c_int32, c_uint64, sizeof, byref
 
 class MemoryStatusEx(Structure):
     _fields_ = [
@@ -63,7 +63,7 @@ def createOutputFileName(path, ext=""):
 	'''Create a valid output filename. if the name of the file already exists the file name is auto-incremented.'''
 	path = os.path.expanduser(path)
 	if not os.path.exists(os.path.dirname(path)):
-		os.makedirs(os.path.dirname(path))
+		os.makedirs(os.path.dirname(path), exist_ok=True)
 
 	if not os.path.exists(path):
 		return path
@@ -184,13 +184,13 @@ def copyfile(srcfile, dstfile, replace=True):
 		# Handle errors while calling os.remove()
 		try:
 			os.remove(dstfile)
-		except:			
+		except OSError:
 			print("Error while deleting file %s. Maybe its in use?" % (dstfile))
 
 		# Handle errors while calling os.ulink()
 		try:
-			os.ulink(dstfile)
-		except:
+			os.unlink(dstfile)
+		except OSError:
 			print("Error while deleting file %s. Maybe its in use?" % (dstfile))
 
 	if os.path.exists(dstfile):
@@ -201,7 +201,7 @@ def copyfile(srcfile, dstfile, replace=True):
 	try:
 		shutil.copy(srcfile, dstfile)
 		return 1, dstfile
-	except:
+	except OSError:
 		print("Error while copying file %s" % (dstfile))
 		return 0, ""
 
@@ -220,7 +220,7 @@ def deletefile(filename):
 	if os.path.exists(filename):
 		try:			
 			os.remove(filename)
-		except:	
+		except OSError:
 			return
 			#log("file is locked, cannot delete: %s " % (filename))
 

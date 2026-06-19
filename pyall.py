@@ -130,12 +130,25 @@ def main():
 
 
 ###############################################################################
-def loaddata(filename, args):
+def _get_runtime_param(runtime_params, key, default=None):
+    if isinstance(runtime_params, dict):
+        return runtime_params.get(key, default)
+    return getattr(runtime_params, key, default)
+
+###############################################################################
+def _set_runtime_param(runtime_params, key, value):
+    if isinstance(runtime_params, dict):
+        runtime_params[key] = value
+    else:
+        setattr(runtime_params, key, value)
+
+###############################################################################
+def loaddata(filename, runtime_params):
     '''load a point cloud and return the cloud'''
 
     start_time = time.time() # time the process
     pointcloud = Cpointcloud()
-    maxpings = int(args.debug)
+    maxpings = int(_get_runtime_param(runtime_params, 'debug', -1))
     if maxpings == -1:
         maxpings = 999999999
 
@@ -143,12 +156,15 @@ def loaddata(filename, args):
     beamcounter = 0
     r = allreader(filename)
 
-    if args.epsg == '0':
+    epsg = str(_get_runtime_param(runtime_params, 'epsg', '0'))
+    if epsg == '0':
         approxlongitude, approxlatitude = r.getapproximatepositon()
-        args.epsg = geodetic.epsgfromlonglat (approxlongitude, approxlatitude)
+        epsg = geodetic.epsgfromlonglat(approxlongitude, approxlatitude)
+        _set_runtime_param(runtime_params, 'epsg', epsg)
 
     #load the python proj projection object library if the user has requested it
-    geo = geodetic.geodesy(args.epsg)
+    geo = geodetic.geodesy(epsg)
+    verbose = bool(_get_runtime_param(runtime_params, 'verbose', False))
     
     #get the record count so we can show a progress bar
     recordcount, starttimestamp, enftimestamp = r.getrecordcount("X")
@@ -169,7 +185,8 @@ def loaddata(filename, args):
             datagram.timestamp = to_timestamp(to_datetime(datagram.recorddate, datagram.time))
             datagram.latitude = tslatitude.getValueAt(datagram.timestamp)
             datagram.longitude = tslongitude.getValueAt(datagram.timestamp)
-            print ("%.5f, %.5f" % (datagram.latitude, datagram.longitude))
+            if verbose:
+                print("%.5f, %.5f" % (datagram.latitude, datagram.longitude))
             x, y, z, q, id, beamcounter = computebathypointcloud(datagram, geo, beamcounter=beamcounter)
             pointcloud.add(x, y, z, q, id)
             update_progress("Extracting Point Cloud", pingcounter/recordcount)

@@ -29,6 +29,15 @@ import lashelper
 import ggmbesstandard
 
 ###########################################################################
+def as_runtime_params(parsed_args):
+	'''normalize parsed runtime options into a serializable dictionary.'''
+	if isinstance(parsed_args, dict):
+		return parsed_args.copy()
+	if hasattr(parsed_args, "__dict__"):
+		return vars(parsed_args).copy()
+	return {}
+
+###########################################################################
 def main():
 
 	iho = ggmbesstandard.sp44()
@@ -47,48 +56,48 @@ def main():
 
 	matches = []
 	args = parser.parse_args()
-	# args.inputfolder = "C:/sampledata/all/B_S2980_3005_20220220_084910.all"
-	args.inputfolder = r"C:\sampledata\all\ncei_order_2023-10-09T06_31_19.276Z\multibeam-item-517619\insitu_ocean\trackline\atlantis\at26-15\multibeam\data\version1\MB\em122\0000_20140521_235308_Atlantis.all.mb58\0000_20140521_235308_Atlantis.all" 
+	runtime_params = as_runtime_params(args)
+	runtime_params.setdefault('spherical', False)
 
-	args.spherical = False
-	args.tvu = True
-	# args.verbose = True	
+	if os.path.isfile(runtime_params['inputfolder']):
+		matches.append(runtime_params['inputfolder'])
 
-	if os.path.isfile(args.inputfolder):
-		matches.append(args.inputfolder)
-
-	if len (args.inputfolder) == 0:
+	if len(runtime_params['inputfolder']) == 0:
 		# no file is specified, so look for a .pos file in the current folder.
 		inputfolder = os.getcwd()
 		matches = fileutils.findFiles2(False, inputfolder, "*.all")
 
-	if os.path.isdir(args.inputfolder):
-		matches = fileutils.findFiles2(False, args.inputfolder, "*.all")
+	if os.path.isdir(runtime_params['inputfolder']):
+		matches = fileutils.findFiles2(False, runtime_params['inputfolder'], "*.all")
+
+	if len(matches) == 0:
+		log("No input .all files found, skipping.", error=True)
+		return
 
 	#make sure we have a folder to write to
-	args.inputfolder = os.path.dirname(matches[0])
+	runtime_params['inputfolder'] = os.path.dirname(matches[0])
 
 	#make an output folder
-	if len(args.odir) == 0:
-		args.odir = os.path.join(args.inputfolder, str("all2point_%s" % (time.strftime("%Y%m%d-%H%M%S"))))
-	makedirs(args.odir)
+	if len(runtime_params['odir']) == 0:
+		runtime_params['odir'] = os.path.join(runtime_params['inputfolder'], str("all2point_%s" % (time.strftime("%Y%m%d-%H%M%S"))))
+	makedirs(runtime_params['odir'])
 
-	logging.basicConfig(filename = os.path.join(args.odir,"all2point_log.txt"), level=logging.INFO)
-	log("configuration: %s" % (str(args)))
-	log("Output Folder: %s" % (args.odir))
+	logging.basicConfig(filename=os.path.join(runtime_params['odir'], "all2point_log.txt"), level=logging.INFO)
+	log("configuration: %s" % (str(runtime_params)))
+	log("Output Folder: %s" % (runtime_params['odir']))
 
 	results = []
-	if args.cpu == '1':
+	if str(runtime_params['cpu']) == '1':
 		for file in matches:
-			all2point(file, args)
+			all2point(file, runtime_params)
 	else:
 		multiprocesshelper.log("Files to Import: %d" %(len(matches)))		
-		cpu = multiprocesshelper.getcpucount(args.cpu)
+		cpu = multiprocesshelper.getcpucount(runtime_params['cpu'])
 		log("Processing with %d CPU's" % (cpu))
 
 		pool = mp.Pool(cpu)
 		multiprocesshelper.g_procprogress.setmaximum(len(matches))
-		poolresults = [pool.apply_async(all2point, (file, args), callback=multiprocesshelper.mpresult) for file in matches]
+		poolresults = [pool.apply_async(all2point, (file, runtime_params), callback=multiprocesshelper.mpresult) for file in matches]
 		pool.close()
 		pool.join()
 		# for idx, result in enumerate (poolresults):
@@ -96,20 +105,20 @@ def main():
 		# 	print (result._value)
 
 ############################################################
-def all2point(filename, args):
+def all2point(filename, runtime_params):
 	'''we will try to auto clean beams by extracting the beam xyzF flag data and attempt to clean in scipy'''
 	'''we then set the beam flags to reject files we think are outliers and write the all file to a new file'''
 
 	#load the python proj projection object library if the user has requested it
-	if args.epsg != "0":
-		geo = geodetic.geodesy(args.epsg)
+	if runtime_params['epsg'] != "0":
+		geo = geodetic.geodesy(runtime_params['epsg'])
 	else:
-		args.epsg = pyall.getsuitableepsg(filename)
-		geo = geodetic.geodesy(args.epsg)
+		runtime_params['epsg'] = pyall.getsuitableepsg(filename)
+		geo = geodetic.geodesy(runtime_params['epsg'])
 
 	log("Processing file: %s" % (filename))
 
-	maxpings = int(args.debug)
+	maxpings = int(runtime_params['debug'])
 	if maxpings == -1:
 		maxpings = 999999999
 
@@ -117,11 +126,11 @@ def all2point(filename, args):
 	beamcountarray = 0
 	
 	log("Loading Point Cloud...")
-	pointcloud = pyall.loaddata(filename, args)
+	pointcloud = pyall.loaddata(filename, runtime_params)
 	xyz = np.column_stack([pointcloud.xarr, pointcloud.yarr, pointcloud.zarr, pointcloud.qarr, pointcloud.idarr])
 
 	#report on RAW POINTS
-	outfile = os.path.join(args.odir, os.path.basename(filename) + "_R.txt")
+	outfile = os.path.join(runtime_params['odir'], os.path.basename(filename) + "_R.txt")
 	np.savetxt(outfile, (xyz), fmt='%.10f', delimiter=',')
 
 	outfilename = os.path.join(outfile + "_Raw_depth.tif")
