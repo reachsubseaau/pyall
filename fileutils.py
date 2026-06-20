@@ -63,8 +63,9 @@ def main(*opargs, **kwargs):
 def createOutputFileName(path, ext=""):
 	'''Create a valid output filename. if the name of the file already exists the file name is auto-incremented.'''
 	path = os.path.expanduser(path)
-	if not os.path.exists(os.path.dirname(path)):
-		os.makedirs(os.path.dirname(path), exist_ok=True)
+	dirname = os.path.dirname(path)
+	if dirname and not os.path.exists(dirname):
+		os.makedirs(dirname, exist_ok=True)
 
 	if not os.path.exists(path):
 		return path
