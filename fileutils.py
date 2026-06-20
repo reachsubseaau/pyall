@@ -202,8 +202,8 @@ def copyfile(srcfile, dstfile, replace=True):
 	try:
 		shutil.copy(srcfile, dstfile)
 		return 1, dstfile
-	except OSError:
-		logging.error("Error while copying file %s" % (dstfile))
+	except OSError as e:
+		logging.error("Error while copying file %s: %s" % (dstfile, e))
 		return 0, ""
 
 ###############################################################################
