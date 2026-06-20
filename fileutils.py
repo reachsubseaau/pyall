@@ -3,8 +3,9 @@ import os
 import fnmatch
 from glob import glob
 import shutil
+import logging
 
-from ctypes import Structure, c_int32, c_uint64, sizeof, byref, windll
+from ctypes import Structure, c_int32, c_uint64, sizeof, byref
 
 class MemoryStatusEx(Structure):
     _fields_ = [
@@ -28,32 +29,32 @@ def main(*opargs, **kwargs):
 	f = open(filename, "w")
 	f.write("gg")
 	f.close()
-	print(filename)
+	logging.info(filename)
 	filename = createOutputFileName(filename, ext="")
-	print(filename)
+	logging.info(filename)
 
 	filename = createOutputFileName(filename, ext="")
-	print(filename)
+	logging.info(filename)
 
 	filename = createOutputFileName(filename, ext="")
-	print(filename)
+	logging.info(filename)
 
 	return
 
 
 	recursive = False
 	# local folder
-	print ("11", findFiles2(recursive, ".", "*.py"))
+	logging.info("11 %s" % (findFiles2(recursive, ".", "*.py")))
 	# absolute folder
 	mypath = os.path.dirname(os.path.realpath(__file__))
-	print ("22", mypath, findFiles2(recursive, mypath, "*.py"))
+	logging.info("22 %s %s" % (mypath, findFiles2(recursive, mypath, "*.py")))
 
 	# recursive local folder
 	recursive = True
-	print ("33",  mypath, findFiles2(recursive, ".", "*.py"))
+	logging.info("33 %s %s" % (mypath, findFiles2(recursive, ".", "*.py")))
 	#recursive absolute folder
 	mypath = os.path.dirname(os.path.realpath(__file__))
-	print ("44",  mypath, findFiles2(recursive, mypath, "*.py"))
+	logging.info("44 %s %s" % (mypath, findFiles2(recursive, mypath, "*.py")))
 
 
 
@@ -62,8 +63,9 @@ def main(*opargs, **kwargs):
 def createOutputFileName(path, ext=""):
 	'''Create a valid output filename. if the name of the file already exists the file name is auto-incremented.'''
 	path = os.path.expanduser(path)
-	if not os.path.exists(os.path.dirname(path)):
-		os.makedirs(os.path.dirname(path))
+	dirname = os.path.dirname(path)
+	if dirname and not os.path.exists(dirname):
+		os.makedirs(dirname, exist_ok=True)
 
 	if not os.path.exists(path):
 		return path
@@ -139,7 +141,7 @@ def findFiles(recursive, filespec, filter):
 		for root, dirnames, filenames in os.walk(os.path.dirname(filespec)):
 			for f in fnmatch.filter(filenames, filter):
 				matches.append(os.path.join(root, f))
-				print (matches[-1])
+				logging.info(matches[-1])
 	else:
 		if os.path.exists(filespec):
 			matches.append (os.path.abspath(filespec))
@@ -147,9 +149,9 @@ def findFiles(recursive, filespec, filter):
 			for filename in glob(filespec):
 				matches.append(filename)
 	if len(matches) == 0:
-		print ("Nothing found to convert, quitting")
+		logging.warning("Nothing found to convert, quitting")
 		return []
-	print ("File Find Count:", len(matches))
+	logging.info("File Find Count: %d" % (len(matches)))
 	return matches
 
 ###############################################################################
@@ -177,32 +179,32 @@ def copyfile(srcfile, dstfile, replace=True):
 	# log ("Copying %s to %s" %(srcfile, dstfile))
 
 	if not os.path.exists(srcfile):
-		print ("source file does not exist, skipping : %s" % (srcfile))
+		logging.error("source file does not exist, skipping : %s" % (srcfile))
 		return 0, ""
 
 	if os.path.isfile(dstfile) and replace:
 		# Handle errors while calling os.remove()
 		try:
 			os.remove(dstfile)
-		except:			
-			print("Error while deleting file %s. Maybe its in use?" % (dstfile))
+		except OSError as e:
+			logging.error("Error while deleting file %s: %s" % (dstfile, e))
 
 		# Handle errors while calling os.ulink()
 		try:
-			os.ulink(dstfile)
-		except:
-			print("Error while deleting file %s. Maybe its in use?" % (dstfile))
+			os.unlink(dstfile)
+		except OSError as e:
+			logging.error("Error while deleting file %s: %s" % (dstfile, e))
 
 	if os.path.exists(dstfile):
-		print ("destination file exists, skipping : %s" % (dstfile))
+		logging.warning("destination file exists, skipping : %s" % (dstfile))
 		return 0 , dstfile
 
 	# the file does not exist so copy it.
 	try:
 		shutil.copy(srcfile, dstfile)
 		return 1, dstfile
-	except:
-		print("Error while copying file %s" % (dstfile))
+	except OSError as e:
+		logging.error("Error while copying file %s: %s" % (dstfile, e))
 		return 0, ""
 
 ###############################################################################
@@ -220,14 +222,14 @@ def deletefile(filename):
 	if os.path.exists(filename):
 		try:			
 			os.remove(filename)
-		except:	
+		except OSError:
 			return
 			#log("file is locked, cannot delete: %s " % (filename))
 
 ###############################################################################
 if __name__ == "__main__":
-	print(outfilename("c:\\temp\\pk.txt", ))
-	print(outfilename("c:/temp/pk.txt", "", "_appendix"))
-	print(outfilename("c:/temp/pk.txt", "prefix_", "_appendix"))
-	print(outfilename("c:/temp/pk.txt", "prefix_", "_appendix", "shp"))
+	logging.info(outfilename("c:\\temp\\pk.txt", ))
+	logging.info(outfilename("c:/temp/pk.txt", "", "_appendix"))
+	logging.info(outfilename("c:/temp/pk.txt", "prefix_", "_appendix"))
+	logging.info(outfilename("c:/temp/pk.txt", "prefix_", "_appendix", "shp"))
 	#main()
