@@ -3,12 +3,12 @@
     "configurations": [        
         {
             "name": "Python",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "stopOnEntry": false,
             "program": "${file}",
             "python": "python.exe",
-            "args": ["-i", "C:/development/python/0004_20110307_041009.all", "-cpu", "1"]
+            "args": ["-i", "./sample/0253_20140104_000401_Duke.all", "-cpu", "1"]
         }
    ]
 }

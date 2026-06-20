@@ -1,0 +1,5 @@
+pyall MCP server starting (stdio transport).
+It does not open a port or a URL - it talks to an MCP client over stdin/stdout.
+Exposing 17 tools: all_to_pointcloud, all_to_tif, batch_process, depth_to_grid, get_attitude, get_clock, get_depth, get_file_info, get_height, get_installation_parameters, get_positions, get_pu_status, get_runtime_parameters, get_seabed_image, get_sound_velocity_profiles, get_surface_sound_speed, get_travel_time
+Waiting for an MCP client to connect... (press Ctrl+C to stop)
+To use it, point an MCP client (Claude Desktop, VS Code, etc.) at this script.

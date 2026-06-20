@@ -13,6 +13,7 @@ import pprint
 import struct
 import os.path
 import time
+import argparse
 from datetime import datetime
 from datetime import timedelta
 import numpy as np
@@ -21,112 +22,90 @@ import geodetic
 import logging
 import timeseries
 import ggmbes
+import fileutils
 ###############################################################################
 def main():
-    # open the ALL file for reading by creating a new allreader class and passin in the filename to open.
-    # filename =   "C:/Python27/ArcGIS10.3/pyall-master/0314_20170421_222154_SA1702-FE_302.all"
-    filename = r"C:\sampledata\all\ncei_order_2023-10-09T06_31_19.276Z\multibeam-item-517619\insitu_ocean\trackline\atlantis\at26-15\multibeam\data\version1\MB\em122\0000_20140521_235308_Atlantis.all.mb58\0000_20140521_235308_Atlantis.all"
-    # filename = "C:/development/python/0004_20110307_041009.all"
-    # filename     = "C:/projects/CARIS/GA-0362_ShoalBay_East_2/raw/0211_20170906_000453_AIMS_Capricornus.all"
-    # filename = "C:/development/python/sample.all"
-    # filename = "d:/projects/RVInvestigator/0073_20161001_103120_Investigator_em710.all"
-    # filename = "C:/projects/RVInvestigator/0016_20160821_150810_Investigator_em710.all"
-    # filename = "c:/projects/carisworldtour/preprocess/0010_20110308_194752.all"
+    '''command line entry point.  Reads a Kongsberg .all file (or a folder of them) and creates point clouds and GeoTIFFs.'''
 
-    r = allreader(filename)
-    pingcount = 0
-    start_time = time.time()  # time the process
+    parser = argparse.ArgumentParser(description='Read a Kongsberg ALL file and create a point cloud and GeoTIFF.')
+    parser.add_argument('-i', action='store', default="", dest='inputfolder', help='Input filename/folder to process.')
+    parser.add_argument('-epsg', action='store', default="0", dest='epsg', help='Specify an output EPSG code for transforming from WGS84 to East,North e.g. -epsg 32756')
+    parser.add_argument('-odir', action='store', default="", dest='odir', help='Specify a relative output folder e.g. -odir GIS')
+    parser.add_argument('-debug', action='store', default="-1", dest='debug', help='Specify the number of pings to process.  good only for debugging. [Default:-1, all]')
+    parser.add_argument('-verbose', action='store_true', default=False, dest='verbose', help='verbose logging.  takes some additional time! [Default:false]')
+    parser.add_argument('-info', action='store_true', default=False, dest='info', help='just report a summary of the file (datagram counts, position, EPSG) and exit.')
+    parser.add_argument('-grid', action='store_true', default=False, dest='grid', help='grid the depth (or reflectivity) into a GeoTIFF instead of exporting a raw point cloud.')
+    parser.add_argument('-resolution', action='store', default='0', dest='resolution', help='grid cell size in metres. 0 auto-computes from beam spacing.  only used with -grid. [Default:0]')
+    parser.add_argument('-value', action='store', default='depth', dest='value', help='quantity to grid: depth or reflectivity.  only used with -grid. [Default:depth]')
+    parser.add_argument('-colour', action='store', default='none', dest='colour', help='grid rendering: none (float), jeca (colour ramp) or grey (greyscale).  only used with -grid. [Default:none]')
+    parser.add_argument('-colourmin', action='store', default='', dest='colourmin', help='minimum value for the colour/greyscale palette (e.g. depth range).  only used with -grid. [Default: full data range]')
+    parser.add_argument('-colourmax', action='store', default='', dest='colourmax', help='maximum value for the colour/greyscale palette (e.g. depth range).  only used with -grid. [Default: full data range]')
+    parser.add_argument('-keeprejected', action='store_true', default=False, dest='keeprejected', help='keep rejected soundings when gridding.  only used with -grid. [Default: rejected soundings are removed]')
 
-    # navigation = r.loadnavigation()
-    # print("Load Navigation Duration: %.2fs" % (time.time() - start_time)) # time the process
-    # print (navigation)
+    args = parser.parse_args()
+    runtime_params = vars(args).copy()
+    runtime_params.setdefault('spherical', False)
 
-    while r.moredata():
-        # read a datagram.  If we support it, return the datagram type and aclass for that datagram
-        # The user then needs to call the read() method for the class to undertake a fileread and binary decode.  This keeps the read super quick.
-        typeofdatagram, datagram = r.readdatagram()
-        logging.debug(typeofdatagram)
+    matches = []
+    if os.path.isfile(runtime_params['inputfolder']):
+        matches.append(runtime_params['inputfolder'])
+    elif os.path.isdir(runtime_params['inputfolder']):
+        matches = fileutils.findFiles2(False, runtime_params['inputfolder'], "*.all")
+    elif len(runtime_params['inputfolder']) == 0:
+        # no file specified, so look in the current folder.
+        matches = fileutils.findFiles2(False, os.getcwd(), "*.all")
 
-        rawbytes = r.readdatagrambytes(datagram.offset, datagram.numberofbytes)
-        # hereis how we compute the checksum
-        # print(sum(rawbytes[5:-3]))
+    if len(matches) == 0:
+        log("No input .all files found. Use -i <file-or-folder> or run in a folder containing .all files.", error=True)
+        print("No input .all files found. Use -i <file-or-folder> or run in a folder containing .all files.")
+        return
 
-        if typeofdatagram == '3':
-            datagram.read()
-            logging.info(datagram.data)
-            continue
+    # just report a summary of each file and exit
+    if runtime_params['info']:
+        for filename in matches:
+            info = getfileinfo(filename)
+            print("File: %s" % (info['filename']))
+            print("  Size: %d bytes" % (info['filesize']))
+            print("  Approx position: lon %.6f lat %.6f" % (info['approxlongitude'], info['approxlatitude']))
+            print("  Suitable EPSG: %s" % (info['epsg']))
+            counts = ", ".join("%s:%d" % (k, v) for k, v in sorted(info['datagramcounts'].items()))
+            print("  Datagrams: %s" % (counts))
+        return
 
-        if typeofdatagram == 'A':
-            datagram.read()
-            # for a in datagram.Attitude:
-            # print ("%.5f, %.3f, %.3f, %.3f, %.3f" % (r.to_timestamp(r.to_datetime(a[0], a[1])), a[3], a[4], a[5], a[6]))
-            continue
+    # make sure we have a folder to write to
+    runtime_params['inputfolder'] = os.path.dirname(matches[0])
 
-        if typeofdatagram == 'C':
-            datagram.read()
-            continue
+    # make an output folder
+    if len(runtime_params['odir']) == 0:
+        runtime_params['odir'] = os.path.join(runtime_params['inputfolder'], str("all2point_%s" % (time.strftime("%Y%m%d-%H%M%S"))))
+    if not os.path.isdir(runtime_params['odir']):
+        os.makedirs(runtime_params['odir'], exist_ok=True)
 
-        if typeofdatagram == 'D':
-            datagram.read()
-            nadirBeam = int(datagram.nbeams / 2)
-            # print (("Nadir depth: %.3f AcrossTrack %.3f transducerdepth %.3f Checksum %s" % (datagram.depth[nadirBeam], datagram.acrosstrackdistance[nadirBeam], datagram.transducerdepth, datagram.checksum)))
-            continue
+    logging.basicConfig(filename=os.path.join(runtime_params['odir'], "all2point_log.txt"), level=logging.INFO)
+    log("Configuration: %s" % (str(runtime_params)))
+    log("Output Folder: %s" % (runtime_params['odir']))
+    print("Output Folder: %s" % (runtime_params['odir']))
 
-        if typeofdatagram == 'f':
-            datagram.read()
-
-        if typeofdatagram == 'H':
-            datagram.read()
-
-        if typeofdatagram == 'i':
-            datagram.read()
-            continue
-
-        if typeofdatagram == 'I':
-            datagram.read()
-            #  print (datagram.installationParameters)
-            #  print ("Lat: %.5f Lon: %.5f" % (datagram.latitude, datagram.longitude))
-            continue
-
-        if typeofdatagram == 'n':
-            datagram.read()
-            continue
-
-        if typeofdatagram == 'N':
-            datagram.read()
-            # print ("Raw Travel times Recorded for %d beams" % datagram.NumReceiveBeams)
-            continue
-
-        if typeofdatagram == 'O':
-            datagram.read()
-            continue
-
-        if typeofdatagram == 'R':
-            datagram.read()
-            continue
-
-        if typeofdatagram == 'U':
-            datagram.read()
-            continue
-
-        if typeofdatagram == 'X':
-            datagram.read()
-            nadirBeam = int(datagram.nbeams / 2)
-            # print (("Nadir depth: %.3f AcrossTrack %.3f transducerdepth %.3f" % (datagram.depth[nadirBeam], datagram.acrosstrackdistance[nadirBeam], datagram.transducerdepth)))
-            pingcount += 1
-            continue
-
-        if typeofdatagram == 'Y':
-            datagram.read()
-            continue
-
-    # print the processing time. It is handy to keep an eye on processing performance.
-    logging.info("Read Duration: %.3f seconds, pingcount %d" %
-                 (time.time() - start_time, pingcount))
-
-    r.rewind()
-    logging.info("Complete reading ALL file :-)")
-    r.close()
+    # process each file sequentially.  multiprocessing is intentionally not used here;
+    # callers that need concurrency (e.g. the MCP server) handle it themselves.
+    requestedepsg = str(runtime_params['epsg'])
+    for filename in matches:
+        fileparams = runtime_params.copy()
+        # reset the epsg per file so auto-detection works correctly for files in different zones
+        fileparams['epsg'] = requestedepsg
+        if runtime_params.get('grid', False):
+            colourmin = float(runtime_params['colourmin']) if str(runtime_params.get('colourmin', '')) != '' else None
+            colourmax = float(runtime_params['colourmax']) if str(runtime_params.get('colourmax', '')) != '' else None
+            outfilename = depthtotif(filename, resolution=runtime_params['resolution'],
+                                     value=runtime_params['value'], colour=runtime_params['colour'],
+                                     epsg=requestedepsg, maxpings=int(runtime_params['debug']),
+                                     verbose=runtime_params['verbose'], odir=runtime_params['odir'],
+                                     colourmin=colourmin, colourmax=colourmax,
+                                     keeprejected=runtime_params['keeprejected'])
+        else:
+            outfilename = all2point(filename, fileparams)
+        if outfilename is not None:
+            print("Created: %s" % (outfilename))
 
 
 ###############################################################################
@@ -153,7 +132,6 @@ def loaddata(filename, runtime_params):
         maxpings = 999999999
 
     pingcounter = 0
-    beamcounter = 0
     r = allreader(filename)
 
     epsg = str(_get_runtime_param(runtime_params, 'epsg', '0'))
@@ -172,8 +150,8 @@ def loaddata(filename, runtime_params):
     #we need to load the navigation to we can compute the position of the transducer at ping time...
     navigation = r.loadnavigation()
     nav = np.array(navigation)
-    tslatitude = timeseries.ctimeSeries(nav[:,0], nav[:,1])
-    tslongitude = timeseries.ctimeSeries(nav[:,0], nav[:,2])
+    tslatitude = timeseries.cTimeSeries(nav[:,0], nav[:,1])
+    tslongitude = timeseries.cTimeSeries(nav[:,0], nav[:,2])
 
     # demonstrate how to load the navigation records into a list.  this is really handy if we want to make a trackplot for coverage
     while r.moredata():
@@ -187,8 +165,8 @@ def loaddata(filename, runtime_params):
             datagram.longitude = tslongitude.getValueAt(datagram.timestamp)
             if verbose:
                 logging.info("Processing ping %d (position loaded)" % (pingcounter + 1))
-            x, y, z, q, id, beamcounter = computebathypointcloud(datagram, geo, beamcounter=beamcounter)
-            pointcloud.add(x, y, z, q, id)
+            x, y, z, q, r_reflectivity = computebathypointcloud(datagram, geo)
+            pointcloud.add(x, y, z, q, r_reflectivity)
             update_progress("Extracting Point Cloud", pingcounter/recordcount)
             pingcounter = pingcounter + 1
 
@@ -218,10 +196,13 @@ def    log(msg, error = False, printmsg=True):
             logging.error(msg)
 
 ###############################################################################
-def computebathypointcloud(datagram, geo, beamcounter):
+def computebathypointcloud(datagram, geo):
     '''using the MRZ datagram, efficiently compute a numpy array of the point clouds  '''
 
     datagram.east, datagram.north = geo.convertToGrid((datagram.longitude), datagram.latitude)
+    # detection / realtime-cleaning flags let us know which soundings have been rejected
+    detinfo = getattr(datagram, 'detectioninformation', None)
+    rtclean = getattr(datagram, 'realtimecleaninginformation', None)
     for idx in range(datagram.nbeams):
 
         beam = ggmbes.GGBeam()
@@ -230,22 +211,25 @@ def computebathypointcloud(datagram, geo, beamcounter):
 
         # beam.depth = (beam.z_reRefPoint_m + datagram.txTransducerDepth_m) * -1.0 #invert depths so we have negative depths.
         # beam.depth = beam.z_reRefPoint_m - datagram.z_waterLevelReRefPoint_m
-        beam.id            = beamcounter
+        beam.backscatter   = datagram.reflectivity[idx]
+        # bit 7 of the detection information flags an invalid/bad detection; a negative realtime cleaning
+        # value flags a beam that has been cleaned out.  capture either as the rejected flag (bit 7).
+        rej = int(detinfo[idx]) if detinfo is not None else 0
+        if rtclean is not None and rtclean[idx] < 0:
+            rej = rej | 0x80
+        beam.rejectionInfo1 = rej
         datagram.beams.append(beam)
-
-        beamcounter     = beamcounter + 1
 
     npeast = np.fromiter((beam.east for beam in datagram.beams), float, count=len(datagram.beams)) #. Also, adding count=len(stars)
     npnorth = np.fromiter((beam.north for beam in datagram.beams), float, count=len(datagram.beams)) #. Also, adding count=len(stars)
     npdepth = np.fromiter((beam.depth for beam in datagram.beams), float, count=len(datagram.beams)) #. Also, adding count=len(stars)
     npq = np.fromiter((beam.rejectionInfo1 for beam in datagram.beams), float, count=len(datagram.beams)) #. Also, adding count=len(stars)
-    npid = np.fromiter((beam.id for beam in datagram.beams), float, count=len(datagram.beams)) #. Also, adding count=len(stars)
-    # npid = np.fromiter((beam.id for beam in datagram.beams), float, count=len(datagram.beams)) #. Also, adding count=len(stars)
+    npreflectivity = np.fromiter((beam.backscatter for beam in datagram.beams), float, count=len(datagram.beams)) #. Also, adding count=len(stars)
 
     # we can now comput absolute positions from the relative positions
     # npLatitude_deg = npdeltaLatitude_deg + datagram.latitude_deg    
     # npLongitude_deg = npdeltaLongitude_deg + datagram.longitude_deg
-    return (npeast, npnorth, npdepth, npq, npid, beamcounter)
+    return (npeast, npnorth, npdepth, npq, npreflectivity)
 
 
 ###############################################################################
@@ -256,6 +240,596 @@ def getsuitableepsg(filename):
     epsg = geodetic.epsgfromlonglat(approxlongitude, approxlatitude)
     r.close()
     return epsg
+
+
+###############################################################################
+def all2point(filename, runtime_params):
+    '''process a single .all file, create a point cloud and export it to a CSV (_R.txt) and a GeoTIFF.
+    returns the path to the created GeoTIFF, or None if no data could be extracted.'''
+    # lazy import so that simply reading datagrams does not require rasterio/scipy
+    import cloud2tif
+
+    # load the proj projection object.  Auto-detect a suitable EPSG if the user did not specify one.
+    epsg = str(_get_runtime_param(runtime_params, 'epsg', '0'))
+    if epsg == '0':
+        epsg = str(getsuitableepsg(filename))
+        _set_runtime_param(runtime_params, 'epsg', epsg)
+    geo = geodetic.geodesy(str(epsg))
+
+    log("Processing file: %s" % (filename))
+    pointcloud = loaddata(filename, runtime_params)
+    if len(pointcloud.xarr) == 0:
+        log("No point cloud data extracted from %s" % (filename), error=True)
+        return None
+
+    xyz = np.column_stack([pointcloud.xarr, pointcloud.yarr, pointcloud.zarr, pointcloud.qarr, pointcloud.rarr])
+
+    odir = _get_runtime_param(runtime_params, 'odir', '') or os.path.dirname(filename)
+    if len(odir) > 0 and not os.path.isdir(odir):
+        os.makedirs(odir, exist_ok=True)
+
+    # report on RAW POINTS
+    outfile = os.path.join(odir, os.path.basename(filename) + "_R.txt")
+    np.savetxt(outfile, (xyz), fmt='%.10f', delimiter=',')
+
+    # rasterise the point cloud into a floating point GeoTIFF
+    outfilename = os.path.join(outfile + "_Raw_depth.tif")
+    cloud2tif.saveastif(outfilename, geo, xyz, resolution=2, fill=False)
+
+    log("Read complete at: %s" % (datetime.now()))
+    return outfilename
+
+
+###############################################################################
+def snapresolution(value):
+    '''snap a raw resolution (metres) up to the next sensible grid interval (0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, ...).'''
+    ladder = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+    for step in ladder:
+        if value <= step:
+            return step
+    return ladder[-1]
+
+###############################################################################
+def computeapproximateresolution(filename, samplepings=10):
+    '''estimate a sensible grid resolution (metres) from the across-track beam spacing of the first few depth pings.
+    the raw spacing is snapped up to the next sensible interval (0.5, 1, 2, 5, 10, ...).'''
+    r = allreader(filename)
+    spacings = []
+    pingcount = 0
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram in ('X', 'D'):
+            datagram.read()
+            ac = [a for a in datagram.acrosstrackdistance if not math.isnan(a)]
+            if len(ac) > 1:
+                spread = max(ac) - min(ac)
+                if spread > 0:
+                    spacings.append(spread / (len(ac) - 1))
+            pingcount += 1
+            if pingcount >= samplepings:
+                break
+    r.close()
+    if len(spacings) == 0:
+        return 1.0
+    return snapresolution(max(float(np.median(spacings)), 0.01))
+
+###############################################################################
+def loadcolourramp(rampfilename=""):
+    '''load an RGB colour ramp (one "R G B" triplet per line, 0-255) and return a numpy array shaped (N, 3).
+    defaults to the jeca.txt ramp shipped alongside this module.'''
+    if len(rampfilename) == 0:
+        rampfilename = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jeca.txt")
+    ramp = []
+    with open(rampfilename, 'r') as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                ramp.append([int(parts[0]), int(parts[1]), int(parts[2])])
+    return np.array(ramp, dtype=np.uint8)
+
+###############################################################################
+def _gridtomean(east, north, value, resolution):
+    '''bin the (east, north, value) points into a regular grid and return the per-cell mean.
+    returns (meanarray, countarray, (xmin, ymin), (xmax, ymax)).  rows run north (top) to south (bottom).'''
+    xy = np.vstack([east, north])
+    mnoriginal = xy.min(axis=1)
+    mxoriginal = xy.max(axis=1)
+
+    # quantise into cells working in centimetres so non-integer resolutions are supported
+    xycm = xy * 100.0
+    xybin = ((xycm + (resolution * 100.0) / 2.0) // (resolution * 100.0)).astype(int)
+    mn = xybin.min(axis=1)
+    mx = xybin.max(axis=1)
+    sz = mx + 1 - mn
+
+    flatidx = np.ravel_multi_index(xybin - mn[:, None], dims=sz)
+    sums = np.bincount(flatidx, value, sz.prod())
+    counts = np.bincount(flatidx, None, sz.prod())
+    mean = sums / np.maximum(1, counts)
+
+    meanarr = np.flip(mean.reshape(sz).T, axis=0)
+    countarr = np.flip(counts.reshape(sz).T, axis=0)
+    return meanarr, countarr, mnoriginal, mxoriginal
+
+###############################################################################
+def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0', outfilename='', fill=False, maxpings=-1, verbose=False, odir='', colourmin=None, colourmax=None, keeprejected=False):
+    '''grid the bathymetry from a .all file into a GeoTIFF.
+
+    resolution : grid cell size in metres.  0 (default) auto-computes a value from the approximate beam spacing,
+                 snapped to a sensible interval (0.5, 1, 2, 5, 10, ...).
+    value      : 'depth' (default) or 'reflectivity' - the quantity to grid.
+    colour     : 'none' (default) -> single band floating point tif.
+                 'jeca'           -> 3 band RGB tif coloured with the jeca.txt ramp.
+                 'grey'           -> 3 band greyscale RGB tif.
+    epsg       : output EPSG code.  '0' auto-detects a suitable projected CRS.
+    odir       : output folder for the auto-named tif.  empty writes next to the input file.
+    colourmin / colourmax : value range (same units as 'value') to stretch the colour/greyscale palette across.
+                 None (default) uses the full data range of each file.
+    keeprejected : when False (default) soundings flagged as rejected (bad detection or cleaned out) are
+                 excluded from the grid.  set True to grid every sounding regardless of its quality flag.
+    returns the path to the created GeoTIFF, or None if no data could be extracted.'''
+    import rasterio
+    from rasterio.transform import from_origin
+
+    # work out the grid resolution
+    if resolution is None or float(resolution) <= 0:
+        resolution = computeapproximateresolution(filename)
+        log("Auto-computed grid resolution: %.3f m" % (resolution))
+    resolution = float(resolution)
+
+    epsg = str(epsg)
+    if epsg == '0':
+        epsg = str(getsuitableepsg(filename))
+    geo = geodetic.geodesy(str(epsg))
+
+    runtime_params = {'epsg': epsg, 'debug': str(maxpings), 'verbose': bool(verbose), 'spherical': False, 'odir': ''}
+    log("Loading point cloud for gridding...")
+    pointcloud = loaddata(filename, runtime_params)
+    if len(pointcloud.xarr) == 0:
+        log("No point cloud data extracted from %s" % (filename), error=True)
+        return None
+
+    east = np.array(pointcloud.xarr, dtype=float)
+    north = np.array(pointcloud.yarr, dtype=float)
+    if value == 'reflectivity':
+        val = np.array(pointcloud.rarr, dtype=float)
+    else:
+        val = np.array(pointcloud.zarr, dtype=float)
+
+    # drop rejected soundings (bit 7 of the quality/rejection flag) unless the caller asks to keep them
+    if not keeprejected:
+        qual = np.array(pointcloud.qarr, dtype=float)
+        if qual.size == east.size:
+            keep = (qual.astype(np.int64) & 0x80) == 0
+            rejectedcount = int((~keep).sum())
+            if rejectedcount > 0:
+                log("Excluding %d rejected soundings from the grid" % (rejectedcount))
+            east = east[keep]
+            north = north[keep]
+            val = val[keep]
+    if east.size == 0:
+        log("No accepted soundings to grid for %s" % (filename), error=True)
+        return None
+
+    arr, countarr, (xmin, ymin), (xmax, ymax) = _gridtomean(east, north, val, resolution)
+    mask = countarr == 0
+
+    height, width = arr.shape
+    transform = from_origin(xmin - resolution / 2.0, ymax + resolution / 2.0, resolution, resolution)
+
+    if len(outfilename) == 0:
+        rendering = colour if colour != 'none' else 'float'
+        suffix = "_%s_%s_%gm.tif" % (value, rendering, resolution)
+        targetdir = odir if len(odir) > 0 else os.path.dirname(filename)
+        if len(targetdir) > 0 and not os.path.isdir(targetdir):
+            os.makedirs(targetdir, exist_ok=True)
+        outfilename = os.path.join(targetdir, os.path.basename(filename) + suffix)
+
+    log("Creating grid tif file... %s (%d x %d @ %.3f m)" % (outfilename, width, height, resolution))
+
+    if colour == 'none':
+        # single band floating point
+        NODATA = -999.0
+        out = np.where(mask, NODATA, arr).astype('float32')
+        with rasterio.open(outfilename, 'w', driver='GTiff', height=height, width=width,
+                           count=1, dtype='float32', crs=geo.projection.srs, transform=transform,
+                           nodata=NODATA, compress='deflate', zlevel=9) as dst:
+            if fill:
+                from rasterio.fill import fillnodata
+                out = fillnodata(out, mask=(~mask).astype('uint8'), max_search_distance=resolution * 2, smoothing_iterations=0)
+            dst.write(out, 1)
+    else:
+        # 3 band RGB (coloured ramp or greyscale)
+        valid = arr[~mask]
+        vmin = float(colourmin) if colourmin is not None else (float(valid.min()) if valid.size else 0.0)
+        vmax = float(colourmax) if colourmax is not None else (float(valid.max()) if valid.size else 1.0)
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        log("Colour palette range: %.3f to %.3f" % (vmin, vmax))
+        norm = np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0)
+        idx = (norm * 255.0).astype(int)
+        idx = np.clip(idx, 0, 255)
+
+        if colour == 'jeca':
+            ramp = loadcolourramp()
+            n = ramp.shape[0] - 1
+            rampidx = np.clip((norm * n).astype(int), 0, n)
+            rgb = ramp[rampidx]  # (h, w, 3)
+            red = rgb[:, :, 0].astype('uint8')
+            green = rgb[:, :, 1].astype('uint8')
+            blue = rgb[:, :, 2].astype('uint8')
+        else:  # grey
+            grey = idx.astype('uint8')
+            red = green = blue = grey
+
+        # nodata cells are rendered black
+        red = np.where(mask, 0, red).astype('uint8')
+        green = np.where(mask, 0, green).astype('uint8')
+        blue = np.where(mask, 0, blue).astype('uint8')
+
+        with rasterio.open(outfilename, 'w', driver='GTiff', height=height, width=width,
+                           count=3, dtype='uint8', crs=geo.projection.srs, transform=transform,
+                           photometric='RGB', compress='deflate', zlevel=9) as dst:
+            dst.write(red, 1)
+            dst.write(green, 2)
+            dst.write(blue, 3)
+
+    log("Creating grid tif file Complete.")
+    return outfilename
+
+
+###############################################################################
+def getfileinfo(filename):
+    '''read a .all file and return a summary dictionary of datagram counts, approximate position and a suitable EPSG code.'''
+    r = allreader(filename)
+    longitude, latitude = r.getapproximatepositon()
+
+    counts = {}
+    starttimestamp = 0
+    endtimestamp = 0
+    recorddate = 0
+    recordtime = 0
+    first = True
+    r.rewind()
+    while r.moredata():
+        numberofbytes, stx, typeofdatagram, emmodel, recorddate, recordtime = r.readdatagramheader()
+        r.fileptr.seek(numberofbytes, 1)
+        if first:
+            starttimestamp = to_timestamp(to_datetime(recorddate, recordtime))
+            first = False
+        counts[typeofdatagram] = counts.get(typeofdatagram, 0) + 1
+    if not first:
+        endtimestamp = to_timestamp(to_datetime(recorddate, recordtime))
+    r.rewind()
+    r.close()
+
+    epsg = geodetic.epsgfromlonglat(longitude, latitude)
+    info = {
+        'filename': filename,
+        'filesize': os.path.getsize(filename),
+        'approxlongitude': longitude,
+        'approxlatitude': latitude,
+        'epsg': str(epsg),
+        'starttimestamp': starttimestamp,
+        'endtimestamp': endtimestamp,
+        'datagramcounts': counts,
+    }
+    return info
+
+
+###############################################################################
+# record loaders - expose individual datagram types in MCP/analysis friendly form
+###############################################################################
+
+###############################################################################
+def loadpositions(filename):
+    '''return all position (P) records as a list of dictionaries with position, time, speed, quality and heading.'''
+    r = allreader(filename)
+    out = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'P':
+            datagram.read()
+            out.append({
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'latitude': datagram.latitude,
+                'longitude': datagram.longitude,
+                'quality': datagram.Quality,
+                'speed': datagram.SpeedOverGround,
+                'course': datagram.CourseOverGround,
+                'heading': datagram.heading,
+                'descriptor': datagram.descriptor,
+            })
+    r.close()
+    return out
+
+###############################################################################
+def loadattitude(filename):
+    '''return all attitude (A) observations as a numpy array with columns [timestamp, roll, pitch, heave, heading].'''
+    r = allreader(filename)
+    rows = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'A':
+            datagram.read()
+            for a in datagram.Attitude:
+                # a = [recorddate, time(sec), status, roll, pitch, heave, heading]
+                rows.append([to_timestamp(to_datetime(a[0], a[1])), a[3], a[4], a[5], a[6]])
+    r.close()
+    if len(rows) == 0:
+        return np.empty((0, 5), dtype=float)
+    return np.array(rows, dtype=float)
+
+###############################################################################
+def loadclock(filename):
+    '''return all clock (C) records as a list of dictionaries.  Useful for analysing clock stability (PC time vs external time).'''
+    r = allreader(filename)
+    out = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'C':
+            datagram.read()
+            externaltimestamp = to_timestamp(to_datetime(datagram.externaldate, datagram.externaltime))
+            out.append({
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'pcutime': datagram.time,
+                'externaltime': datagram.externaltime,
+                'externaltimestamp': externaltimestamp,
+                'difference': datagram.time - datagram.externaltime,
+                'pps': datagram.pps,
+            })
+    r.close()
+    return out
+
+###############################################################################
+def loadheight(filename):
+    '''return all height (h) records as a list of dictionaries.'''
+    r = allreader(filename)
+    out = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'h':
+            datagram.read()
+            out.append({
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'height': datagram.Height,
+                'heighttype': datagram.HeightType,
+            })
+    r.close()
+    return out
+
+###############################################################################
+def loadsoundvelocityprofiles(filename):
+    '''return all sound velocity profile (U) datagrams as a list of dictionaries with depth and sound speed arrays.'''
+    r = allreader(filename)
+    out = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'U':
+            datagram.read()
+            out.append({
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'profiledate': datagram.ProfileDate,
+                'profiletime': datagram.Profiletime,
+                'numentries': datagram.NEntries,
+                'depth': [d[0] for d in datagram.data],
+                'soundspeed': [d[1] for d in datagram.data],
+            })
+    r.close()
+    return out
+
+###############################################################################
+def loadsurfacesoundspeed(filename):
+    '''return all surface sound speed (G) datagrams as a list of dictionaries.  Sound speed is in m/s.'''
+    r = allreader(filename)
+    out = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'G':
+            datagram.read()
+            speeds = [e[1] for e in datagram.soundspeed]
+            out.append({
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'counter': datagram.counter,
+                'numentries': datagram.NEntries,
+                'meansoundspeed': (sum(speeds) / len(speeds)) if speeds else 0.0,
+                'minsoundspeed': min(speeds) if speeds else 0.0,
+                'maxsoundspeed': max(speeds) if speeds else 0.0,
+                'soundspeed': datagram.soundspeed,
+            })
+    r.close()
+    return out
+
+###############################################################################
+def loadruntimeparameters(filename):
+    '''return all runtime parameter (R) records as a list of dictionaries of the decoded sonar settings.'''
+    r = allreader(filename)
+    out = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'R':
+            datagram.read()
+            out.append({
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'emmodel': datagram.emmodel,
+                'serialnumber': datagram.serialnumber,
+                'depthmode': datagram.depthmode,
+                'txpulseform': datagram.TXPulseForm,
+                'dualswathmode': datagram.dualSwathMode,
+                'filtersetting': datagram.filterSetting,
+                'minimumdepth': datagram.minimumdepth,
+                'maximumdepth': datagram.maximumdepth,
+                'absorptioncoefficient': datagram.absorptionCoefficient,
+                'transmitpulselength': datagram.transmitPulseLength,
+                'transmitbeamwidth': datagram.transmitBeamWidth,
+                'transmitpower': datagram.transmitPower,
+                'receivebeamwidth': datagram.receiveBeamWidth,
+                'beamspacing': datagram.beamSpacingString,
+                'maximumportwidth': datagram.maximumPortWidth,
+                'maximumportcoveragedegrees': datagram.maximumPortCoverageDegrees,
+                'maximumstbdwidth': datagram.maximumStbdWidth,
+                'maximumstbdcoveragedegrees': datagram.maximumStbdCoverageDegrees,
+                'yawstabilisation': datagram.yawAndPitchStabilisationMode,
+            })
+    r.close()
+    return out
+
+###############################################################################
+def loadtraveltime(filename, maxrecords=-1):
+    '''return raw range and beam angle (N) records as a list of dictionaries.  Each record contains per-beam
+    pointing angle, two way travel time, reflectivity and quality lists.  maxrecords limits the number returned.'''
+    if maxrecords == -1:
+        maxrecords = 999999999
+    r = allreader(filename)
+    out = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'N':
+            datagram.read()
+            out.append({
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'counter': datagram.counter,
+                'soundspeedattransducer': datagram.soundspeedattransducer,
+                'numtransmitsector': datagram.NumTransmitSector,
+                'numreceivebeams': datagram.NumReceiveBeams,
+                'numvaliddetections': datagram.NumValidDetect,
+                'samplefrequency': datagram.samplefrequency,
+                'beampointingangle': list(datagram.BeamPointingAngle),
+                'twowaytraveltime': list(datagram.TwoWayTraveltime),
+                'reflectivity': list(datagram.reflectivity),
+                'qualityfactor': list(datagram.qualityfactor),
+            })
+            if len(out) >= maxrecords:
+                break
+    r.close()
+    return out
+
+###############################################################################
+def loadinstallationparameters(filename):
+    '''return the first installation (I) datagram parameters as a dictionary.'''
+    r = allreader(filename)
+    info = {}
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'I':
+            datagram.read()
+            info = {
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'emmodel': datagram.emmodel,
+                'serialnumber': datagram.serialnumber,
+                'secondaryserialnumber': datagram.Secondaryserialnumber,
+                'surveylinenumber': datagram.SurveyLineNumber,
+                'parameters': datagram.installationParameters,
+            }
+            break
+    r.close()
+    return info
+
+###############################################################################
+def loaddepth(filename, maxpings=-1):
+    '''return per-beam soundings from the X (and D) depth datagrams as a dictionary of 1d numpy arrays:
+    pingtimestamp, depth, acrosstrack, alongtrack, reflectivity, quality.  maxpings limits the number of pings.'''
+    if maxpings == -1:
+        maxpings = 999999999
+    r = allreader(filename)
+    pingts, depth, across, along, refl, qual = [], [], [], [], [], []
+    pingcount = 0
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram in ('X', 'D'):
+            datagram.read()
+            ts = to_timestamp(to_datetime(datagram.recorddate, datagram.time))
+            for i in range(datagram.nbeams):
+                pingts.append(ts)
+                depth.append(datagram.depth[i])
+                across.append(datagram.acrosstrackdistance[i])
+                along.append(datagram.alongtrackdistance[i])
+                refl.append(datagram.reflectivity[i])
+                qual.append(datagram.qualityfactor[i])
+            pingcount += 1
+            if pingcount >= maxpings:
+                break
+    r.close()
+    return {
+        'pingtimestamp': np.array(pingts, dtype=float),
+        'depth': np.array(depth, dtype=float),
+        'acrosstrack': np.array(across, dtype=float),
+        'alongtrack': np.array(along, dtype=float),
+        'reflectivity': np.array(refl, dtype=float),
+        'quality': np.array(qual, dtype=float),
+    }
+
+###############################################################################
+def loadseabedimage(filename, maxpings=-1):
+    '''return seabed image (Y) backscatter samples as a dictionary of numpy arrays:
+    pingtimestamp (per ping), numsamples (per ping) and samples (all samples concatenated, 0.1 dB).  maxpings limits the pings.'''
+    if maxpings == -1:
+        maxpings = 999999999
+    r = allreader(filename)
+    pingts, numsamples, allsamples = [], [], []
+    pingcount = 0
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'Y':
+            datagram.read()
+            pingts.append(to_timestamp(to_datetime(datagram.recorddate, datagram.time)))
+            numsamples.append(datagram.numSamples)
+            allsamples.extend(datagram.samples)
+            pingcount += 1
+            if pingcount >= maxpings:
+                break
+    r.close()
+    return {
+        'pingtimestamp': np.array(pingts, dtype=float),
+        'numsamples': np.array(numsamples, dtype=int),
+        'samples': np.array(allsamples, dtype=float),
+    }
+
+###############################################################################
+def loadpustatus(filename):
+    '''return all PU status (1) records as a list of dictionaries (sensor health and last received sensor values).'''
+    r = allreader(filename)
+    out = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == '1':
+            datagram.read()
+            out.append({
+                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+                'counter': datagram.counter,
+                'serialnumber': datagram.serialnumber,
+                'pingrate': datagram.pingrate,
+                'pingcounter': datagram.pingcounter,
+                'ppsstatus': datagram.ppsstatus,
+                'positionstatus': datagram.positionstatus,
+                'attitudestatus': datagram.attitudestatus,
+                'clockstatus': datagram.clockstatus,
+                'headingstatus': datagram.headingstatus,
+                'pustatus': datagram.pustatus,
+                'lastheading': datagram.lastheading,
+                'lastroll': datagram.lastroll,
+                'lastpitch': datagram.lastpitch,
+                'lastheave': datagram.lastheave,
+                'soundspeedattransducer': datagram.soundspeedattransducer,
+                'lastdepth': datagram.lastdepth,
+                'alongshipvelocity': datagram.alongshipvelocity,
+                'cputemperature': datagram.cputemperature,
+            })
+    r.close()
+    return out
 
 
 ###############################################################################
@@ -284,7 +858,7 @@ class Cpointcloud:
         self.yarr = []
         self.zarr = []
         self.qarr = []
-        self.idarr = []
+        self.rarr = []
         # idarr = []
         # self.xarr = np.array(npx)
         # self.yarr = np.array(npy)
@@ -293,7 +867,7 @@ class Cpointcloud:
         # self.idarr = np.array(npid)
 
     ###############################################################################
-    def add(self, npx, npy, npz, npq, nid):
+    def add(self, npx, npy, npz, npq, nr=None):
         '''add the new ping of data to the existing array '''
         # self.xarr = np.append(self.xarr, np.array(npx))
         # self.yarr = np.append(self.yarr, np.array(npy))
@@ -303,8 +877,8 @@ class Cpointcloud:
         self.yarr.extend(npy)
         self.zarr.extend(npz)
         self.qarr.extend(npq)
-        self.idarr.extend(nid)
-        # self.idarr.extend(npid)
+        if nr is not None:
+            self.rarr.extend(nr)
 
 
 ###############################################################################
@@ -406,7 +980,7 @@ class allreader:
         self.rewind()
         while self.moredata():
             try:
-                # print(self.fileptr.tell())
+                # logging.debug(self.fileptr.tell())
                 typeofdatagram, datagram = self.readdatagram()
                 if (typeofdatagram == 'P'):
                     datagram.read()
@@ -505,6 +1079,12 @@ class allreader:
             return dg.typeofdatagram, dg
         if typeofdatagram == 'U':  # U Sound Velocity
             dg = U_SVP(self.fileptr, numberofbytes)
+            return dg.typeofdatagram, dg
+        if typeofdatagram == 'G':  # G Surface sound speed
+            dg = G_SURFACESOUNDSPEED(self.fileptr, numberofbytes)
+            return dg.typeofdatagram, dg
+        if typeofdatagram == '1':  # 1 PU Status
+            dg = PU_STATUS(self.fileptr, numberofbytes)
             return dg.typeofdatagram, dg
         if typeofdatagram == 'X':  # X depth
             dg = X_depth(self.fileptr, numberofbytes)
@@ -1360,7 +1940,7 @@ class I_INSTALLATION:
         self.installationParameters = {}
         for p in parameters:
             parts = p.split("=")
-            # print (parts)
+            # logging.debug(parts)
             if len(parts) > 1:
                 self.installationParameters[parts[0]] = parts[1].strip()
 
@@ -1758,7 +2338,7 @@ class P_POSITION_ENCODER:
         fulldatagram = fulldatagram + footer
         return fulldatagram
         # except:
-        # print ("error encoding POSITION Record")
+        # logging.error("error encoding POSITION Record")
         # return
 
 ###############################################################################
@@ -2293,6 +2873,124 @@ class Y_SEABEDIMAGE:
         fulldatagram = fulldatagram + footer
 
         return fulldatagram
+
+###############################################################################
+class G_SURFACESOUNDSPEED:
+    '''Surface sound speed datagram (type 'G', 0x47).  Holds the sound speed measured at the
+    transducer head sampled regularly throughout the record.  Ref: Simrad EM Datagrams Oct 2013, Table 40.'''
+    def __init__(self, fileptr, numberofbytes):
+        self.typeofdatagram = 'G'
+        self.offset = fileptr.tell()
+        self.numberofbytes = numberofbytes
+        self.fileptr = fileptr
+        self.fileptr.seek(numberofbytes, 1)
+        self.soundspeed = []
+
+###############################################################################
+    def read(self):
+        self.fileptr.seek(self.offset, 0)
+        rec_fmt = '=LBBHLLHHH'
+        rec_len = struct.calcsize(rec_fmt)
+        rec_unpack = struct.Struct(rec_fmt).unpack_from
+        s = rec_unpack(self.fileptr.read(rec_len))
+
+        self.stx = s[1]
+        self.typeofdatagram = chr(s[2])
+        self.emmodel = s[3]
+        self.recorddate = s[4]
+        self.time = float(s[5] / 1000.0)
+        self.counter = s[6]
+        self.serialnumber = s[7]
+        self.NEntries = s[8]
+
+        # each entry is [time in seconds since record start, sound speed in m/s]
+        self.soundspeed = []
+        entry_fmt = '=HH'
+        entry_len = struct.calcsize(entry_fmt)
+        entry_unpack = struct.Struct(entry_fmt).unpack
+        for i in range(self.NEntries):
+            e = entry_unpack(self.fileptr.read(entry_len))
+            self.soundspeed.append([float(e[0]), float(e[1]) / 10.0])  # dm/s -> m/s
+
+        # always leave the file pointer at the end of this record
+        self.fileptr.seek(self.offset + self.numberofbytes, 0)
+
+###############################################################################
+class PU_STATUS:
+    '''Processing Unit status datagram (type '1', 0x31).  Sent about once per second; reports
+    sensor input health and the last received sensor values.  Ref: Simrad EM Datagrams Oct 2013, Table 53.'''
+    def __init__(self, fileptr, numberofbytes):
+        self.typeofdatagram = '1'
+        self.offset = fileptr.tell()
+        self.numberofbytes = numberofbytes
+        self.fileptr = fileptr
+        self.fileptr.seek(numberofbytes, 1)
+        self.data = ""
+
+###############################################################################
+    def read(self):
+        self.fileptr.seek(self.offset, 0)
+        rec_fmt = '=LBBHLLHHHHLLLLLLbbbbbBHhhhHLhBBbbbBHBBHhhhbBH'
+        rec_len = struct.calcsize(rec_fmt)
+
+        # guard against shorter (older firmware) variants so the scan stays aligned
+        if self.numberofbytes < rec_len:
+            self.fileptr.seek(self.offset + self.numberofbytes, 0)
+            self.stx = 0
+            self.emmodel = 0
+            self.recorddate = self.recorddate if hasattr(self, 'recorddate') else 0
+            return
+
+        rec_unpack = struct.Struct(rec_fmt).unpack_from
+        s = rec_unpack(self.fileptr.read(rec_len))
+
+        self.stx = s[1]
+        self.typeofdatagram = chr(s[2])
+        self.emmodel = s[3]
+        self.recorddate = s[4]
+        self.time = float(s[5] / 1000.0)
+        self.counter = s[6]
+        self.serialnumber = s[7]
+        self.pingrate = float(s[8] / 100.0)                 # centiHz -> Hz
+        self.pingcounter = s[9]
+        self.achievedswathdistance = s[10]                  # in 10% steps, 0-255
+        self.sensorinputstatusUDP2 = s[11]
+        self.sensorinputstatusserial1 = s[12]
+        self.sensorinputstatusserial2 = s[13]
+        self.sensorinputstatusserial3 = s[14]
+        self.sensorinputstatusserial4 = s[15]
+        self.ppsstatus = s[16]
+        self.positionstatus = s[17]
+        self.attitudestatus = s[18]
+        self.clockstatus = s[19]
+        self.headingstatus = s[20]
+        self.pustatus = s[21]
+        self.lastheading = float(s[22] / 100.0)             # 0.01 deg -> deg
+        self.lastroll = float(s[23] / 100.0)
+        self.lastpitch = float(s[24] / 100.0)
+        self.lastheave = float(s[25] / 100.0)               # cm -> m
+        self.soundspeedattransducer = float(s[26] / 10.0)   # dm/s -> m/s
+        self.lastdepth = float(s[27] / 100.0)               # cm -> m
+        self.alongshipvelocity = float(s[28] / 100.0)       # 0.01 m/s -> m/s
+        self.attitudevelocitysensorstatus = s[29]
+        self.mammalprotectionramp = s[30]
+        self.backscatteratobliqueangle = s[31]              # dB
+        self.backscatteratnormalincidence = s[32]           # dB
+        self.fixedgain = s[33]                              # dB
+        self.depthtonormalincidence = s[34]                 # m
+        self.rangetonormalincidence = s[35]                 # m
+        self.portcoverage = s[36]                           # deg
+        self.stbdcoverage = s[37]                           # deg
+        self.soundspeedfromprofile = float(s[38] / 10.0)    # dm/s -> m/s
+        self.yawstabilisation = float(s[39] / 100.0)        # centideg -> deg
+        self.portcoverageoracrossvelocity = s[40]
+        self.stbdcoverageordownvelocity = s[41]
+        self.cputemperature = s[42]                          # deg C (EM2040)
+        self.etx = s[43]
+        self.checksum = s[44]
+
+        # always leave the file pointer at the end of this record
+        self.fileptr.seek(self.offset + self.numberofbytes, 0)
 
 ###############################################################################
 # time HELPER FUNCTIONS

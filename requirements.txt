@@ -1,0 +1,7 @@
+numpy
+rasterio
+pyproj
+scipy
+pyshp
+plotly
+mcp
