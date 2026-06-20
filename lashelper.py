@@ -1232,7 +1232,7 @@ def getcpucount(requestedcpu):
 	return int(requestedcpu)
 
 ###############################################################################
-def	log(msg, error = False):
+def	log(msg, error = False, printmsg=True):
 		if error == False:
 			logging.info(msg)
 		else:

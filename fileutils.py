@@ -63,9 +63,8 @@ def main(*opargs, **kwargs):
 def createOutputFileName(path, ext=""):
 	'''Create a valid output filename. if the name of the file already exists the file name is auto-incremented.'''
 	path = os.path.expanduser(path)
-	dirname = os.path.dirname(path)
-	if dirname and not os.path.exists(dirname):
-		os.makedirs(dirname, exist_ok=True)
+	if not os.path.exists(os.path.dirname(path)):
+		os.makedirs(os.path.dirname(path), exist_ok=True)
 
 	if not os.path.exists(path):
 		return path
@@ -186,14 +185,14 @@ def copyfile(srcfile, dstfile, replace=True):
 		# Handle errors while calling os.remove()
 		try:
 			os.remove(dstfile)
-		except OSError as e:
-			logging.error("Error while deleting file %s: %s" % (dstfile, e))
+		except OSError:
+			logging.error("Error while deleting file %s. Maybe its in use?" % (dstfile))
 
 		# Handle errors while calling os.ulink()
 		try:
 			os.unlink(dstfile)
-		except OSError as e:
-			logging.error("Error while deleting file %s: %s" % (dstfile, e))
+		except OSError:
+			logging.error("Error while deleting file %s. Maybe its in use?" % (dstfile))
 
 	if os.path.exists(dstfile):
 		logging.warning("destination file exists, skipping : %s" % (dstfile))
@@ -203,8 +202,8 @@ def copyfile(srcfile, dstfile, replace=True):
 	try:
 		shutil.copy(srcfile, dstfile)
 		return 1, dstfile
-	except OSError as e:
-		logging.error("Error while copying file %s: %s" % (dstfile, e))
+	except OSError:
+		logging.error("Error while copying file %s" % (dstfile))
 		return 0, ""
 
 ###############################################################################

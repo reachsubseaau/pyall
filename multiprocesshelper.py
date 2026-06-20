@@ -9,7 +9,7 @@ REQUIRED_GB_PER_CPU = 4
 
 
 ###############################################################################
-def	log(msg, error = False):
+def	log(msg, error = False, printmsg=True):
 		if error == False:
 			logging.info(msg)
 		else:

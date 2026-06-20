@@ -369,7 +369,7 @@ def point2raster(outfilename, geo, pcd, resolution=1, bintype="mean", fill=False
 
 	return outfilename
 ###############################################################################
-def	log(msg, error = False):
+def	log(msg, error = False, printmsg=True):
 		if error == False:
 			logging.info(msg)
 		else:
