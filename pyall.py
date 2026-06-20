@@ -45,7 +45,7 @@ def main():
         # read a datagram.  If we support it, return the datagram type and aclass for that datagram
         # The user then needs to call the read() method for the class to undertake a fileread and binary decode.  This keeps the read super quick.
         typeofdatagram, datagram = r.readdatagram()
-        print(typeofdatagram, end='')
+        logging.debug(typeofdatagram)
 
         rawbytes = r.readdatagrambytes(datagram.offset, datagram.numberofbytes)
         # hereis how we compute the checksum
@@ -53,7 +53,7 @@ def main():
 
         if typeofdatagram == '3':
             datagram.read()
-            print(datagram.data)
+            logging.info(datagram.data)
             continue
 
         if typeofdatagram == 'A':
@@ -121,21 +121,34 @@ def main():
             continue
 
     # print the processing time. It is handy to keep an eye on processing performance.
-    print("Read Duration: %.3f seconds, pingcount %d" %
-          (time.time() - start_time, pingcount))
+    logging.info("Read Duration: %.3f seconds, pingcount %d" %
+                 (time.time() - start_time, pingcount))
 
     r.rewind()
-    print("Complete reading ALL file :-)")
+    logging.info("Complete reading ALL file :-)")
     r.close()
 
 
 ###############################################################################
-def loaddata(filename, args):
+def _get_runtime_param(runtime_params, key, default=None):
+    if isinstance(runtime_params, dict):
+        return runtime_params.get(key, default)
+    return getattr(runtime_params, key, default)
+
+###############################################################################
+def _set_runtime_param(runtime_params, key, value):
+    if isinstance(runtime_params, dict):
+        runtime_params[key] = value
+    else:
+        setattr(runtime_params, key, value)
+
+###############################################################################
+def loaddata(filename, runtime_params):
     '''load a point cloud and return the cloud'''
 
     start_time = time.time() # time the process
     pointcloud = Cpointcloud()
-    maxpings = int(args.debug)
+    maxpings = int(_get_runtime_param(runtime_params, 'debug', -1))
     if maxpings == -1:
         maxpings = 999999999
 
@@ -143,15 +156,18 @@ def loaddata(filename, args):
     beamcounter = 0
     r = allreader(filename)
 
-    if args.epsg == '0':
+    epsg = str(_get_runtime_param(runtime_params, 'epsg', '0'))
+    if epsg == '0':
         approxlongitude, approxlatitude = r.getapproximatepositon()
-        args.epsg = geodetic.epsgfromlonglat (approxlongitude, approxlatitude)
+        epsg = geodetic.epsgfromlonglat(approxlongitude, approxlatitude)
+        _set_runtime_param(runtime_params, 'epsg', epsg)
 
     #load the python proj projection object library if the user has requested it
-    geo = geodetic.geodesy(args.epsg)
+    geo = geodetic.geodesy(epsg)
+    verbose = bool(_get_runtime_param(runtime_params, 'verbose', False))
     
     #get the record count so we can show a progress bar
-    recordcount, starttimestamp, enftimestamp = r.getrecordcount("X")
+    recordcount, starttimestamp, endtimestamp = r.getrecordcount("X")
 
     #we need to load the navigation to we can compute the position of the transducer at ping time...
     navigation = r.loadnavigation()
@@ -169,7 +185,8 @@ def loaddata(filename, args):
             datagram.timestamp = to_timestamp(to_datetime(datagram.recorddate, datagram.time))
             datagram.latitude = tslatitude.getValueAt(datagram.timestamp)
             datagram.longitude = tslongitude.getValueAt(datagram.timestamp)
-            print ("%.5f, %.5f" % (datagram.latitude, datagram.longitude))
+            if verbose:
+                logging.info("Processing ping %d (position loaded)" % (pingcounter + 1))
             x, y, z, q, id, beamcounter = computebathypointcloud(datagram, geo, beamcounter=beamcounter)
             pointcloud.add(x, y, z, q, id)
             update_progress("Extracting Point Cloud", pingcounter/recordcount)
@@ -195,8 +212,6 @@ def update_progress(job_title, progress):
 
 ###############################################################################
 def    log(msg, error = False, printmsg=True):
-        if printmsg:
-            print (msg)
         if error == False:
             logging.info(msg)
         else:
@@ -301,7 +316,7 @@ class allreader:
 
     def __init__(self, ALLfileName):
         if not os.path.isfile(ALLfileName):
-            print("file not found:", ALLfileName)
+            logging.error("file not found: %s", ALLfileName)
         self.fileName = ALLfileName
         self.fileptr = open(ALLfileName, 'rb')
         self.fileSize = os.path.getsize(ALLfileName)
@@ -409,7 +424,7 @@ class allreader:
                     break
             except:
                 e = sys.exc_info()[0]
-                print("Error: %s.  Please check file.  it seems to be corrupt: %s" % (e, self.fileName))
+                logging.error("Error: %s.  Please check file.  it seems to be corrupt: %s" % (e, self.fileName))
         self.rewind()
         return longitude, latitude
 
@@ -707,7 +722,7 @@ class A_ATTITUDE_ENCODER:
             header = struct.pack(header_fmt, fulldatagrambytecount-4, stx, typeofdatagram,
                                  model, recorddate, recordtime, counter, serialnumber, numEntries)
         except:
-            print("error encoding attitude")
+            logging.error("error encoding attitude")
             # header = struct.pack(header_fmt, fulldatagrambytecount-4, stx, typeofdatagram, model, recorddate, recordtime, counter, serialnumber, numEntries)
 
         fulldatagram = fulldatagram + header
@@ -726,7 +741,7 @@ class A_ATTITUDE_ENCODER:
                 bodyrecord = struct.pack(rec_fmt, timemillisecs, sensorstatus, int(
                     roll*100), int(pitch*100), int(heave*100), int(heading*100), systemdescriptor)
             except:
-                print("error encoding attitude")
+                logging.error("error encoding attitude")
                 bodyrecord = struct.pack(rec_fmt, timemillisecs, sensorstatus, int(
                     roll*100), int(pitch*100), int(heave*100), int(heading*100), systemdescriptor)
             fulldatagram = fulldatagram + bodyrecord
@@ -1298,7 +1313,7 @@ class h_HEIGHT_ENCODER:
             footer = struct.pack('=BH', etx, checksum)
             fulldatagram = fulldatagram + footer
         except:
-            print("error encoding height field")
+            logging.error("error encoding height field")
             # header = struct.pack(rec_fmt, rec_len-4, stx, ord(typeofdatagram), model, int(recorddate), int(recordtime), counter, serialnumber, int(height * 100), int(heightType), etx, checksum)
         return fulldatagram
 

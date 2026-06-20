@@ -40,7 +40,7 @@ def runner(cmd, verbose=False):
 	for stderr_line in iter(popen.stderr.readline, ""):
 		stderr.append(stderr_line)
 		if verbose:
-			print(stderr_line.rstrip())
+			logging.info(stderr_line.rstrip())
 	for stdout_line in iter(popen.stdout.readline, ""):
 		stdout.append(stdout_line)
 	popen.stdout.close()
@@ -420,8 +420,8 @@ def lasoverage(srcfolder, dstfolder, filespec, resolution, overageresolution, ep
 	filespec = os.path.join(srcfolder, filespec)
 	filespec = filespec.replace('\\','/')
 
-	print ("******Overage files to process: %s" % (filespec))
-	print ("******Overage output folder: %s" % (dstfolder))
+	logging.info("******Overage files to process: %s" % (filespec))
+	logging.info("******Overage output folder: %s" % (dstfolder))
 
 	dstfolder = dstfolder.replace('\\','/')
 	odirlog = makedirs(dstfolder)
@@ -430,7 +430,7 @@ def lasoverage(srcfolder, dstfolder, filespec, resolution, overageresolution, ep
 		cutresolution = float(resolution)
 	else:
 		cutresolution = float(overageresolution)
-	print ("******Overage Resolution: %.3f, Grid Resolution %.3f" % (cutresolution, float(resolution)))
+	logging.info("******Overage Resolution: %.3f, Grid Resolution %.3f" % (cutresolution, float(resolution)))
 
 	# #we need to ensure we dont cause edge effects
 	# resolution = float(resolution) / 4  #pkpk we needed to make this 1 for the cross lines in A14 as the infill did not work well.  not sure whats is happening yet.
@@ -468,8 +468,8 @@ def lasoveragenew(srcfolder, dstfolder, filespec, resolution=1, overageresolutio
 	filespec = os.path.join(srcfolder, filespec)
 	filespec = filespec.replace('\\','/')
 
-	print ("******Overage2 files to process: %s" % (filespec))
-	print ("******Overage2 output folder: %s" % (dstfolder))
+	logging.info("******Overage2 files to process: %s" % (filespec))
+	logging.info("******Overage2 output folder: %s" % (dstfolder))
 
 	dstfolder = dstfolder.replace('\\','/')
 	# odirlog = makedirs(dstfolder)
@@ -478,7 +478,7 @@ def lasoveragenew(srcfolder, dstfolder, filespec, resolution=1, overageresolutio
 		cutresolution = float(resolution)
 	else:
 		cutresolution = float(overageresolution)
-	print ("******Overage Resolution: %.3f, Grid Resolution %.3f" % (cutresolution, float(resolution)))
+	logging.info("******Overage Resolution: %.3f, Grid Resolution %.3f" % (cutresolution, float(resolution)))
 
 	# #we need to ensure we dont cause edge effects
 	# resolution = float(resolution) / 4  #pkpk we needed to make this 1 for the cross lines in A14 as the infill did not work well.  not sure whats is happening yet.
@@ -1233,8 +1233,6 @@ def getcpucount(requestedcpu):
 
 ###############################################################################
 def	log(msg, error = False, printmsg=True):
-		if printmsg:
-			print (msg)
 		if error == False:
 			logging.info(msg)
 		else:
@@ -1281,4 +1279,4 @@ class MEMORYSTATUSEX(ctypes.Structure):
 
 ###################################################################################################
 if __name__ == "__main__":
-	print("lashelper.py copyright GuardianGeomatics Pty Ltd")
+	logging.info("lashelper.py copyright GuardianGeomatics Pty Ltd")

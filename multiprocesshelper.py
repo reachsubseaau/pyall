@@ -5,11 +5,11 @@ import ctypes
 import logging
 from datetime import datetime, timedelta
 
+REQUIRED_GB_PER_CPU = 4
+
 
 ###############################################################################
 def	log(msg, error = False, printmsg=True):
-		if printmsg:
-			print (msg)
 		if error == False:
 			logging.info(msg)
 		else:
@@ -24,30 +24,38 @@ def mpresult(msg):
 ###############################################################################
 def getcpucount(requestedcpu):
 	'''control how many CPU's we use for multi processing'''
-	if int(requestedcpu) == 0:
+	try:
+		requestedcpu = int(requestedcpu)
+	except (TypeError, ValueError):
+		requestedcpu = 0
+
+	if requestedcpu <= 0:
 		requestedcpu = multiprocessing.cpu_count()
+		availablememoryingigs = get_available_memory_gb()
+		if availablememoryingigs is not None:
+			maxcpu = max(1, int(availablememoryingigs / REQUIRED_GB_PER_CPU))
+			if requestedcpu > maxcpu:
+				requestedcpu = maxcpu
 
-		stat = MEMORYSTATUSEX()
-		ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-		# print("MemoryLoad: %d%%" % (stat.dwMemoryLoad))
-		# print("MemoryAvailable: %d%%" % (stat.ullAvailPhys/(1024*1024*1024)))
-		availablememoryingigs = stat.ullAvailPhys/(1024*1024*1024)
-		# make sure we have enough memory per CPU
-		requiredgigspercpu = 4
+	return max(1, int(requestedcpu))
 
-		maxcpu = max(1, int(availablememoryingigs/ requiredgigspercpu))
-		# ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-		# print("MemoryLoad: %d%%" % (stat.dwMemoryLoad))
-		# ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-		# print("MemoryLoad: %d%%" % (stat.dwMemoryLoad))
-		# ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-		# print("MemoryLoad: %d%%" % (stat.dwMemoryLoad))
-		# ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-		# print("MemoryLoad: %d%%" % (stat.dwMemoryLoad))
+###############################################################################
+def get_available_memory_gb():
+	'''return available physical memory in GB, if it can be determined.'''
+	if hasattr(ctypes, "windll"):
+		try:
+			stat = MEMORYSTATUSEX()
+			ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+			return stat.ullAvailPhys/(1024*1024*1024)
+		except (AttributeError, OSError):
+			return None
 
-		if int(requestedcpu) > maxcpu:
-			requestedcpu = maxcpu
-	return int(requestedcpu)
+	try:
+		pagesize = os.sysconf("SC_PAGE_SIZE")
+		availpages = os.sysconf("SC_AVPHYS_PAGES")
+		return (pagesize * availpages) / (1024 * 1024 * 1024)
+	except (ValueError, OSError, AttributeError):
+		return None
 
 ###############################################################################
 class MEMORYSTATUSEX(ctypes.Structure):
