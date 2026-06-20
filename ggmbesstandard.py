@@ -223,14 +223,14 @@ class standard:
 		return outfilename, xydz
 
 	###############################################################################
-	def	log(self, msg, error = False, printmsg=True):
+	def	log(self, msg, error = False):
 			if error == False:
 				logging.info(msg)
 			else:
 				logging.error(msg)
 
 ###############################################################################
-def	log(msg, error = False, printmsg=True):
+def	log(msg, error = False):
 		if error == False:
 			logging.info(msg)
 		else:

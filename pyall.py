@@ -186,7 +186,7 @@ def loaddata(filename, runtime_params):
             datagram.latitude = tslatitude.getValueAt(datagram.timestamp)
             datagram.longitude = tslongitude.getValueAt(datagram.timestamp)
             if verbose:
-                logging.info("Processing ping %d (position loaded)" % (pingcounter + 1))
+                logging.info("Processing ping %d (lat=%.5f, lon=%.5f)" % (pingcounter + 1, datagram.latitude, datagram.longitude))
             x, y, z, q, id, beamcounter = computebathypointcloud(datagram, geo, beamcounter=beamcounter)
             pointcloud.add(x, y, z, q, id)
             update_progress("Extracting Point Cloud", pingcounter/recordcount)
@@ -211,7 +211,7 @@ def update_progress(job_title, progress):
     sys.stdout.flush()
 
 ###############################################################################
-def    log(msg, error = False, printmsg=True):
+def    log(msg, error = False):
         if error == False:
             logging.info(msg)
         else:

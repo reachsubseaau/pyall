@@ -185,14 +185,14 @@ def copyfile(srcfile, dstfile, replace=True):
 		# Handle errors while calling os.remove()
 		try:
 			os.remove(dstfile)
-		except OSError:
-			logging.error("Error while deleting file %s. Maybe its in use?" % (dstfile))
+		except OSError as e:
+			logging.error("Error while deleting file %s: %s" % (dstfile, e))
 
 		# Handle errors while calling os.ulink()
 		try:
 			os.unlink(dstfile)
-		except OSError:
-			logging.error("Error while deleting file %s. Maybe its in use?" % (dstfile))
+		except OSError as e:
+			logging.error("Error while deleting file %s: %s" % (dstfile, e))
 
 	if os.path.exists(dstfile):
 		logging.warning("destination file exists, skipping : %s" % (dstfile))

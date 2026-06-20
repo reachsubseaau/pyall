@@ -155,7 +155,7 @@ def	makedirs(odir):
 		os.makedirs(odir, exist_ok=True)
 
 ###############################################################################
-def	log(msg, error = False, printmsg=True):
+def	log(msg, error = False):
 		if error == False:
 			logging.info(msg)
 		else:
