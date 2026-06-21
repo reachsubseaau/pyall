@@ -1,0 +1,32 @@
+# Keep the build context small and avoid copying local/dev artefacts into the image.
+
+# Python virtual environment and caches
+.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Version control / editor
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Local logs, status and generated outputs
+logs/
+*.log
+pyall_status.json
+sample/all2point_*/
+sample/test_colour/
+*_R.txt
+*.tif
+
+# Docker / CI files themselves
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# OS cruft
+.DS_Store
+Thumbs.db

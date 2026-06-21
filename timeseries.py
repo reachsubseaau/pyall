@@ -1,9 +1,6 @@
 import os
 import math
 import numpy as np
-from scipy import signal
-import plotly.graph_objects as go
-
 ###############################################################################
 def main():
     '''an example how to use the time series class.
@@ -32,8 +29,6 @@ def main():
     ts.spikefilter2()
 
     smooth = ts.smoothfilter(window_length=11, polyorder=2)
-    # Plot the original and filtered values
-    ts.plot_before_after(original_values, smooth=smooth)
 
 ###############################################################################
 class cTimeSeries:
@@ -87,9 +82,6 @@ class cTimeSeries:
         
         length = max(1, math.floor(len(self.values) / 10))
         smooth = self.smoothfilter(window_length=length, polyorder=2)
-        
-        # Plot the original and filtered values
-        self.plot_before_after(original_values, smooth=smooth)
         pass
     
     ###############################################################################
@@ -98,58 +90,6 @@ class cTimeSeries:
         result = signal.savgol_filter(self.values, window_length=window_length, polyorder=polyorder)
         return result
 
-    ###############################################################################
-    def plot_before_after(self, original_values, smooth=None):
-        '''Plot the original and filtered values using Plotly'''
-        fig = go.Figure()
-
-        # Add original values trace
-        fig.add_trace(go.Scatter(
-            x=self.times, y=original_values,
-            mode='lines+markers',
-            name='Original Values'
-        ))
-
-        # Add filtered values trace
-        fig.add_trace(go.Scatter(
-            x=self.times, y=self.values,
-            mode='lines+markers',
-            name='Filtered Values'
-        ))
-        # add the smooth trace
-        fig.add_trace(go.Scatter(
-            x=self.times, y=smooth,
-            mode='lines+markers',
-            name='Filtered, Smoothed Values'
-        ))
-        
-        # Update layout
-        fig.update_layout(
-            title='Original and Filtered Time Series Data',
-            xaxis_title='Time',
-            yaxis_title='Values'
-        )
-        # Update layout to auto-scale
-        fig.update_layout(
-            title='Original and Filtered Time Series Data',
-            xaxis_title='Time',
-            yaxis_title='Values',
-            autosize=True,
-            yaxis=dict(tickformat='.2f'),
-        )
-        # Show plot
-        fig.show()
-        pass
-    ###############################################################################
-    def spikefilter(self, weight=11, threshold=10):
-        '''use scipy.signal.savgol to remove outliers and smooth the values'''
-        # self.values = signal.savgol_filter(self.values, window_length=weight, polyorder=3, mode="nearest")
-        values = signal.medfilt(self.values, kernel_size=weight)
-        #plot the results so we can see if it works
-        
-        for idx, v in enumerate(values):
-            if abs(v - self.values[idx]) > threshold:
-                self.values[idx] = v
     ###############################################################################
     def getValueAt(self, timestamp):
         return np.interp(timestamp, self.times, self.values, left=None, right=None)

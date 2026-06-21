@@ -3,5 +3,4 @@ rasterio
 pyproj
 scipy
 pyshp
-plotly
 mcp

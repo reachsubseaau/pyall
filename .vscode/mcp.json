@@ -1,0 +1,18 @@
+{
+  // pyall MCP server configuration for VS Code.
+  // - "pyall" (stdio): VS Code launches the server for you using the project's venv.
+  // - "pyall-http": connect to a server you started yourself with
+  //       .venv\Scripts\python.exe pyall_mcp.py --http --host 0.0.0.0 --port 8000 --root <data-folder>
+  //   Start that process first, then start this server entry in VS Code.
+  "servers": {
+    "pyall": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["${workspaceFolder}/pyall_mcp.py"]
+    },
+    "pyall-http": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}

@@ -147,3 +147,8 @@ $RECYCLE.BIN/
 =======
 >>>>>>> origin/master
 sample/**
+
+# pyall runtime logs and status (shared rotating log folder)
+logs/
+pyall_status.json
+

@@ -142,21 +142,16 @@ def main():
 
 ###############################################################################
 def epsgfromlonglat (longitude, latitude):
-	from pyproj import CRS
-	from pyproj.aoi import AreaOfInterest
-	from pyproj.database import query_utm_crs_info
+	'''return the WGS84 UTM EPSG code for a longitude/latitude.
 
-	utm_crs_list = query_utm_crs_info(
-		datum_name="WGS 84",
-		area_of_interest=AreaOfInterest(
-			west_lon_degree=longitude,
-			south_lat_degree=latitude,
-			east_lon_degree=longitude,
-			north_lat_degree=latitude,
-		),
-	)
-	utm_crs = CRS.from_epsg(utm_crs_list[0].code)
-	return utm_crs_list[0].code
+	Computed directly from the 6-degree UTM zone, so it is instant and needs no pyproj database
+	lookup (the previous query_utm_crs_info call cost ~40 ms per call and could raise IndexError
+	near the poles).  Northern hemisphere -> 326zz, southern hemisphere -> 327zz.'''
+	zone = int((longitude + 180.0) // 6.0) + 1
+	# wrap into the valid 1..60 range (e.g. longitude exactly +180 maps to zone 1)
+	zone = ((zone - 1) % 60) + 1
+	code = (32600 if latitude >= 0 else 32700) + zone
+	return str(code)
 
 ###############################################################################
 def medfilt (x, k):

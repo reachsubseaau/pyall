@@ -13,6 +13,8 @@ import pprint
 import struct
 import os.path
 import time
+import io
+import json
 import argparse
 from datetime import datetime
 from datetime import timedelta
@@ -20,9 +22,38 @@ import numpy as np
 
 import geodetic
 import logging
+import logging.handlers
+import threading
 import timeseries
 import ggmbes
 import fileutils
+
+###############################################################################
+# per-thread progress hook
+#
+# Long processing runs (loaddata / depthtotif / backscattertotif) call _emitprogress() as they
+# work through the pings.  A consumer (e.g. the MCP server) registers a hook with setprogresshook()
+# on the SAME thread that runs the processing, so it receives a 0..1 fraction and a message and can
+# stream it to its client.  The hook is thread-local so concurrent jobs do not cross-talk.
+###############################################################################
+_progresslocal = threading.local()
+
+def setprogresshook(hook):
+    '''register (or clear, with None) a progress callback hook(fraction0to1, message) for this thread.'''
+    _progresslocal.hook = hook
+
+def _emitprogress(fraction, message=''):
+    '''report progress to the current thread's hook, if one is registered.  Never raises.'''
+    hook = getattr(_progresslocal, 'hook', None)
+    if hook is None:
+        return
+    try:
+        f = float(fraction)
+        f = 0.0 if f < 0.0 else (1.0 if f > 1.0 else f)
+        hook(f, message)
+    except Exception:
+        pass
+
 ###############################################################################
 def main():
     '''command line entry point.  Reads a Kongsberg .all file (or a folder of them) and creates point clouds and GeoTIFFs.'''
@@ -41,6 +72,8 @@ def main():
     parser.add_argument('-colourmin', action='store', default='', dest='colourmin', help='minimum value for the colour/greyscale palette (e.g. depth range).  only used with -grid. [Default: full data range]')
     parser.add_argument('-colourmax', action='store', default='', dest='colourmax', help='maximum value for the colour/greyscale palette (e.g. depth range).  only used with -grid. [Default: full data range]')
     parser.add_argument('-keeprejected', action='store_true', default=False, dest='keeprejected', help='keep rejected soundings when gridding.  only used with -grid. [Default: rejected soundings are removed]')
+    parser.add_argument('-noshade', action='store_true', default=False, dest='noshade', help='disable the default hillshade blended into colour/greyscale depth grids.  only used with -grid -value depth. [Default: hillshade on, sun 325 deg / 15 deg]')
+    parser.add_argument('-vertical', action='store', default='waterline', dest='vertical', choices=['transducer', 'waterline', 'ellipsoid'], help="sounding vertical reference: 'transducer' (raw z), 'waterline' (add transducer depth) or 'ellipsoid' (also apply the Height datagram). [Default: waterline]")
 
     args = parser.parse_args()
     runtime_params = vars(args).copy()
@@ -67,6 +100,25 @@ def main():
             print("File: %s" % (info['filename']))
             print("  Size: %d bytes" % (info['filesize']))
             print("  Approx position: lon %.6f lat %.6f" % (info['approxlongitude'], info['approxlatitude']))
+            if info.get('firstposition') and info.get('lastposition'):
+                fp = info['firstposition']
+                lp = info['lastposition']
+                print("  First position: lon %.6f lat %.6f" % (fp['longitude'], fp['latitude']))
+                print("  Last  position: lon %.6f lat %.6f" % (lp['longitude'], lp['latitude']))
+            print("  Duration: %.0f s (%.2f hours)" % (info['durationseconds'], info['durationseconds'] / 3600.0))
+            print("  Track distance: %.1f m (%.2f NM)" % (info['trackdistancemetres'], info['trackdistancenauticalmiles']))
+            print("  Vessel speed: %.2f kn (%.2f m/s)" % (info['vesselspeedknots'], info['vesselspeedmps']))
+            if info.get('courseovergrounddegrees') is not None:
+                print("  Course over ground: %.1f deg" % (info['courseovergrounddegrees']))
+            if info.get('approxwaterdepthm') is not None:
+                print("  Approx water depth: %.1f m" % (info['approxwaterdepthm']))
+            if info.get('centrefrequencyhz') is not None:
+                print("  Centre frequency: %.0f Hz" % (info['centrefrequencyhz']))
+            if info.get('swathcoveragedegrees') is not None:
+                print("  Swath / sector angle: %d deg (port %d, stbd %d)" % (
+                    info['swathcoveragedegrees'], info['portcoveragedegrees'], info['stbdcoveragedegrees']))
+            if info.get('depthmode'):
+                print("  Depth mode: %s" % (info['depthmode']))
             print("  Suitable EPSG: %s" % (info['epsg']))
             counts = ", ".join("%s:%d" % (k, v) for k, v in sorted(info['datagramcounts'].items()))
             print("  Datagrams: %s" % (counts))
@@ -81,7 +133,7 @@ def main():
     if not os.path.isdir(runtime_params['odir']):
         os.makedirs(runtime_params['odir'], exist_ok=True)
 
-    logging.basicConfig(filename=os.path.join(runtime_params['odir'], "all2point_log.txt"), level=logging.INFO)
+    setup_logging()
     log("Configuration: %s" % (str(runtime_params)))
     log("Output Folder: %s" % (runtime_params['odir']))
     print("Output Folder: %s" % (runtime_params['odir']))
@@ -96,12 +148,23 @@ def main():
         if runtime_params.get('grid', False):
             colourmin = float(runtime_params['colourmin']) if str(runtime_params.get('colourmin', '')) != '' else None
             colourmax = float(runtime_params['colourmax']) if str(runtime_params.get('colourmax', '')) != '' else None
-            outfilename = depthtotif(filename, resolution=runtime_params['resolution'],
-                                     value=runtime_params['value'], colour=runtime_params['colour'],
-                                     epsg=requestedepsg, maxpings=int(runtime_params['debug']),
-                                     verbose=runtime_params['verbose'], odir=runtime_params['odir'],
-                                     colourmin=colourmin, colourmax=colourmax,
-                                     keeprejected=runtime_params['keeprejected'])
+            if str(runtime_params.get('value', 'depth')) == 'reflectivity':
+                # backscatter uses the dedicated AVG-corrected mosaic path, not the bathymetry gridder
+                outfilename = backscattertotif(filename, resolution=runtime_params['resolution'],
+                                               epsg=requestedepsg, maxpings=int(runtime_params['debug']),
+                                               verbose=runtime_params['verbose'], odir=runtime_params['odir'],
+                                               colour=runtime_params['colour'],
+                                               colourmin=colourmin, colourmax=colourmax,
+                                               keeprejected=runtime_params['keeprejected'])
+            else:
+                outfilename = depthtotif(filename, resolution=runtime_params['resolution'],
+                                         value=runtime_params['value'], colour=runtime_params['colour'],
+                                         epsg=requestedepsg, maxpings=int(runtime_params['debug']),
+                                         verbose=runtime_params['verbose'], odir=runtime_params['odir'],
+                                         colourmin=colourmin, colourmax=colourmax,
+                                         keeprejected=runtime_params['keeprejected'],
+                                         shade=not runtime_params.get('noshade', False),
+                                         vertical=runtime_params.get('vertical', 'waterline'))
         else:
             outfilename = all2point(filename, fileparams)
         if outfilename is not None:
@@ -134,6 +197,9 @@ def loaddata(filename, runtime_params):
     pingcounter = 0
     r = allreader(filename)
 
+    # folder we report live status into (consumed by monitor.py)
+    statusodir = _get_runtime_param(runtime_params, 'odir', '') or os.path.dirname(os.path.abspath(filename))
+
     epsg = str(_get_runtime_param(runtime_params, 'epsg', '0'))
     if epsg == '0':
         approxlongitude, approxlatitude = r.getapproximatepositon()
@@ -147,11 +213,31 @@ def loaddata(filename, runtime_params):
     #get the record count so we can show a progress bar
     recordcount, starttimestamp, endtimestamp = r.getrecordcount("X")
 
+    writestatus(statusodir, state='loading', job='Extracting Point Cloud',
+                file=os.path.basename(filename), progress=0.0, pings=0,
+                recordcount=int(recordcount), epsg=str(epsg), elapsed=0.0)
+
     #we need to load the navigation to we can compute the position of the transducer at ping time...
     navigation = r.loadnavigation()
     nav = np.array(navigation)
     tslatitude = timeseries.cTimeSeries(nav[:,0], nav[:,1])
     tslongitude = timeseries.cTimeSeries(nav[:,0], nav[:,2])
+
+    # vertical reference for the soundings.  The XYZ88 z is relative to the transmit transducer, so:
+    #   'transducer' -> leave z as-is (raw, re transducer face)
+    #   'waterline'  -> add the transducer depth (draft + heave at ping) so z is re the water line  [default]
+    #   'ellipsoid'  -> additionally remove the Height (h) datagram so z is re the ellipsoid (GPS tide)
+    vertical = str(_get_runtime_param(runtime_params, 'vertical', 'waterline')).lower()
+    tsheight = None
+    if vertical == 'ellipsoid':
+        heights = loadheight(filename)
+        if len(heights) >= 1:
+            ht = np.array([[h['timestamp'], h['height']] for h in heights], dtype=float)
+            tsheight = timeseries.cTimeSeries(ht[:, 0], ht[:, 1])
+        else:
+            log("vertical=ellipsoid requested but no Height (h) datagrams found; using water line instead", error=True)
+            vertical = 'waterline'
+    log("Vertical reference: %s" % (vertical))
 
     # demonstrate how to load the navigation records into a list.  this is really handy if we want to make a trackplot for coverage
     while r.moredata():
@@ -165,16 +251,32 @@ def loaddata(filename, runtime_params):
             datagram.longitude = tslongitude.getValueAt(datagram.timestamp)
             if verbose:
                 logging.info("Processing ping %d (position loaded)" % (pingcounter + 1))
-            x, y, z, q, r_reflectivity = computebathypointcloud(datagram, geo)
+            # per-ping vertical offset (metres, positive down) onto the chosen datum
+            if vertical == 'transducer':
+                zoffset = 0.0
+            else:
+                zoffset = float(getattr(datagram, 'transducerdepth', 0.0) or 0.0)
+                if vertical == 'ellipsoid' and tsheight is not None:
+                    zoffset -= float(tsheight.getValueAt(datagram.timestamp))
+            x, y, z, q, r_reflectivity = computebathypointcloud(datagram, geo, zoffset)
             pointcloud.add(x, y, z, q, r_reflectivity)
             update_progress("Extracting Point Cloud", pingcounter/recordcount)
             pingcounter = pingcounter + 1
+            _emitprogress(pingcounter / recordcount if recordcount else 0.0, "Extracting point cloud")
+            writestatus(statusodir, throttle=0.5, state='processing', job='Extracting Point Cloud',
+                        file=os.path.basename(filename),
+                        progress=(pingcounter / recordcount) if recordcount else 0.0,
+                        pings=pingcounter, recordcount=int(recordcount), epsg=str(epsg),
+                        elapsed=time.time() - start_time)
 
         if pingcounter == maxpings:
             break
 
     r.close()
     log("Load Duration: %.3f seconds" % (time.time() - start_time))
+    writestatus(statusodir, state='loaded', job='Extracting Point Cloud',
+                file=os.path.basename(filename), progress=1.0, pings=pingcounter,
+                recordcount=int(recordcount), epsg=str(epsg), elapsed=time.time() - start_time)
 
     return pointcloud
 
@@ -196,8 +298,93 @@ def    log(msg, error = False, printmsg=True):
             logging.error(msg)
 
 ###############################################################################
-def computebathypointcloud(datagram, geo):
-    '''using the MRZ datagram, efficiently compute a numpy array of the point clouds  '''
+# centralised rotating log + live status (shared by the CLI and the MCP server)
+###############################################################################
+LOGFILENAME = 'pyall.log'
+STATUSFILENAME = 'pyall_status.json'
+_statusfile_lastwrite = 0.0
+
+###############################################################################
+def logdirectory():
+    '''return the folder that holds the shared rotating log and the central status file.
+    Override with the PYALL_LOG_DIR environment variable; defaults to a "logs" folder
+    next to this module so the CLI, the MCP server and the monitor all agree on it.'''
+    d = os.environ.get('PYALL_LOG_DIR', '')
+    if not d:
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    return d
+
+###############################################################################
+def setup_logging(logdir=None, level=logging.INFO, maxbytes=5 * 1024 * 1024, backups=5):
+    '''configure the root logger to write to a single rotating log file shared by the whole
+    toolkit (CLI runs and the MCP server).  Safe to call repeatedly.  Returns the log path.'''
+    if logdir is None:
+        logdir = logdirectory()
+    try:
+        os.makedirs(logdir, exist_ok=True)
+    except OSError:
+        pass
+    logpath = os.path.join(logdir, LOGFILENAME)
+    root = logging.getLogger()
+    root.setLevel(level)
+    # only add our rotating handler once, even if called many times
+    for h in root.handlers:
+        if getattr(h, '_pyall_rotating', False):
+            return logpath
+    handler = logging.handlers.RotatingFileHandler(
+        logpath, maxBytes=maxbytes, backupCount=backups, encoding='utf-8')
+    handler._pyall_rotating = True
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    root.addHandler(handler)
+    return logpath
+
+###############################################################################
+def statusfilepath(odir):
+    '''return the path of the status json file written inside an output folder.'''
+    return os.path.join(odir, STATUSFILENAME) if odir else ''
+
+###############################################################################
+def _writestatusfile(path, fields):
+    '''atomically write a status dict to a single json file.  never raises.'''
+    try:
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(fields, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+###############################################################################
+def writestatus(odir, throttle=0.0, **fields):
+    '''record live processing status so the monitor web page can display progress.
+    Writes a central status file (in logdirectory(), which the monitor watches) and, when
+    an output folder is given, a copy inside that folder.  This never raises - status
+    reporting must not interfere with processing.'''
+    global _statusfile_lastwrite
+    try:
+        now = time.time()
+        # avoid hammering the disk when called every ping
+        if throttle and (now - _statusfile_lastwrite) < throttle and fields.get('state') == 'processing':
+            return
+        _statusfile_lastwrite = now
+        fields.setdefault('updated', now)
+        # central status - the one place the monitor always looks
+        _writestatusfile(os.path.join(logdirectory(), STATUSFILENAME), fields)
+        # per-output-folder copy for browsing a specific job folder
+        if odir:
+            _writestatusfile(statusfilepath(odir), fields)
+    except Exception:
+        pass
+
+###############################################################################
+def computebathypointcloud(datagram, geo, zoffset=0.0):
+    '''using the depth datagram, efficiently compute numpy arrays of the point cloud.
+
+    zoffset (metres, positive down) is added to every beam depth to move the soundings from the
+    transmit-transducer reference onto the chosen vertical datum (water line or ellipsoid).'''
 
     datagram.east, datagram.north = geo.convertToGrid((datagram.longitude), datagram.latitude)
     # detection / realtime-cleaning flags let us know which soundings have been rejected
@@ -206,11 +393,10 @@ def computebathypointcloud(datagram, geo):
     for idx in range(datagram.nbeams):
 
         beam = ggmbes.GGBeam()
-        beam.depth = datagram.depth[idx]
+        # depth from the telegram is re the transmit transducer; zoffset references it to the chosen datum
+        beam.depth = datagram.depth[idx] + zoffset
         beam.east, beam.north = geodetic.calculateGridPositionFromBearingDxDy(datagram.east, datagram.north, datagram.heading, datagram.acrosstrackdistance[idx], datagram.alongtrackdistance[idx])
 
-        # beam.depth = (beam.z_reRefPoint_m + datagram.txTransducerDepth_m) * -1.0 #invert depths so we have negative depths.
-        # beam.depth = beam.z_reRefPoint_m - datagram.z_waterLevelReRefPoint_m
         beam.backscatter   = datagram.reflectivity[idx]
         # bit 7 of the detection information flags an invalid/bad detection; a negative realtime cleaning
         # value flags a beam that has been cleaned out.  capture either as the rejected flag (bit 7).
@@ -243,6 +429,20 @@ def getsuitableepsg(filename):
 
 
 ###############################################################################
+def _savexyzcsv(path, east, north, depth, quality, reflectivity):
+    '''write the raw point cloud CSV (east,north,depth,quality,reflectivity) at sensible precision.
+
+    Uses a single combined format string so np.savetxt does one format per row instead of one per
+    field, and drops the old fake %.10f precision (1 mm is plenty for projected metres) - this is
+    faster and produces a much smaller file on the millions of soundings in a large .all file.'''
+    xyz = np.column_stack([
+        np.asarray(east, dtype=float), np.asarray(north, dtype=float),
+        np.asarray(depth, dtype=float), np.asarray(quality, dtype=float),
+        np.asarray(reflectivity, dtype=float)])
+    np.savetxt(path, xyz, fmt='%.3f,%.3f,%.3f,%.0f,%.2f')
+
+
+###############################################################################
 def all2point(filename, runtime_params):
     '''process a single .all file, create a point cloud and export it to a CSV (_R.txt) and a GeoTIFF.
     returns the path to the created GeoTIFF, or None if no data could be extracted.'''
@@ -268,15 +468,18 @@ def all2point(filename, runtime_params):
     if len(odir) > 0 and not os.path.isdir(odir):
         os.makedirs(odir, exist_ok=True)
 
-    # report on RAW POINTS
+    # report on RAW POINTS - fast vectorised CSV writer (np.savetxt is far too slow on large files)
     outfile = os.path.join(odir, os.path.basename(filename) + "_R.txt")
-    np.savetxt(outfile, (xyz), fmt='%.10f', delimiter=',')
+    _savexyzcsv(outfile, pointcloud.xarr, pointcloud.yarr, pointcloud.zarr, pointcloud.qarr, pointcloud.rarr)
 
     # rasterise the point cloud into a floating point GeoTIFF
     outfilename = os.path.join(outfile + "_Raw_depth.tif")
     cloud2tif.saveastif(outfilename, geo, xyz, resolution=2, fill=False)
 
     log("Read complete at: %s" % (datetime.now()))
+    writestatus(odir, state='done', job='Extracting Point Cloud',
+                file=os.path.basename(filename), progress=1.0, epsg=str(epsg),
+                geotiff=outfilename, pointcloud_csv=outfile)
     return outfilename
 
 
@@ -290,9 +493,12 @@ def snapresolution(value):
     return ladder[-1]
 
 ###############################################################################
-def computeapproximateresolution(filename, samplepings=10):
+def computeapproximateresolution(filename, samplepings=10, coarsen=1.5):
     '''estimate a sensible grid resolution (metres) from the across-track beam spacing of the first few depth pings.
-    the raw spacing is snapped up to the next sensible interval (0.5, 1, 2, 5, 10, ...).'''
+    the raw median spacing is multiplied by *coarsen* (default 1.5) and then snapped up to the next sensible
+    interval (0.5, 1, 2, 5, 10, ...).  The mild coarsening keeps a couple of soundings per cell so the auto grid
+    is not speckled/holed, while staying close to the true beam spacing - raw spacing alone grids too fine and
+    a large factor grids too coarse.'''
     r = allreader(filename)
     spacings = []
     pingcount = 0
@@ -312,7 +518,7 @@ def computeapproximateresolution(filename, samplepings=10):
     r.close()
     if len(spacings) == 0:
         return 1.0
-    return snapresolution(max(float(np.median(spacings)), 0.01))
+    return snapresolution(max(float(np.median(spacings)) * coarsen, 0.01))
 
 ###############################################################################
 def loadcolourramp(rampfilename=""):
@@ -353,7 +559,7 @@ def _gridtomean(east, north, value, resolution):
     return meanarr, countarr, mnoriginal, mxoriginal
 
 ###############################################################################
-def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0', outfilename='', fill=False, maxpings=-1, verbose=False, odir='', colourmin=None, colourmax=None, keeprejected=False):
+def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0', outfilename='', fill=False, maxpings=-1, verbose=False, odir='', colourmin=None, colourmax=None, keeprejected=False, shade=True, shadeazimuth=325.0, shadealtitude=15.0, vertical='waterline'):
     '''grid the bathymetry from a .all file into a GeoTIFF.
 
     resolution : grid cell size in metres.  0 (default) auto-computes a value from the approximate beam spacing,
@@ -368,8 +574,12 @@ def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0',
                  None (default) uses the full data range of each file.
     keeprejected : when False (default) soundings flagged as rejected (bad detection or cleaned out) are
                  excluded from the grid.  set True to grid every sounding regardless of its quality flag.
+    shade      : when True (default) a hillshade is blended over a colour/greyscale depth raster for shaded
+                 relief.  Ignored for the single band float output (colour='none').
+    shadeazimuth / shadealtitude : hillshade sun direction (deg from north) and elevation (deg). [Default: 325, 15]
+    vertical   : sounding vertical reference - 'transducer' (raw), 'waterline' (add transducer depth, default)
+                 or 'ellipsoid' (also remove the Height datagram).
     returns the path to the created GeoTIFF, or None if no data could be extracted.'''
-    import rasterio
     from rasterio.transform import from_origin
 
     # work out the grid resolution
@@ -383,7 +593,7 @@ def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0',
         epsg = str(getsuitableepsg(filename))
     geo = geodetic.geodesy(str(epsg))
 
-    runtime_params = {'epsg': epsg, 'debug': str(maxpings), 'verbose': bool(verbose), 'spherical': False, 'odir': ''}
+    runtime_params = {'epsg': epsg, 'debug': str(maxpings), 'verbose': bool(verbose), 'spherical': False, 'odir': '', 'vertical': vertical}
     log("Loading point cloud for gridding...")
     pointcloud = loaddata(filename, runtime_params)
     if len(pointcloud.xarr) == 0:
@@ -426,6 +636,36 @@ def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0',
             os.makedirs(targetdir, exist_ok=True)
         outfilename = os.path.join(targetdir, os.path.basename(filename) + suffix)
 
+    return _savegridtotif(outfilename, arr, mask, geo, transform, resolution,
+                          colour=colour, colourmin=colourmin, colourmax=colourmax, fill=fill,
+                          shade=shade, shadeazimuth=shadeazimuth, shadealtitude=shadealtitude)
+
+
+###############################################################################
+def _hillshade(array, azimuth=325.0, altitude=15.0, cellsize=1.0):
+    '''compute shaded relief (0..1) from a 2d elevation/depth array.
+
+    azimuth   : direction of the illuminating sun, degrees clockwise from north. [Default: 325]
+    altitude  : sun elevation above the horizon, degrees. [Default: 15]
+    cellsize  : grid cell size (metres) so the shading is consistent at any resolution.'''
+    az = 360.0 - float(azimuth)
+    x, y = np.gradient(array, float(cellsize) if cellsize else 1.0)
+    slope = np.pi / 2.0 - np.arctan(np.sqrt(x * x + y * y))
+    aspect = np.arctan2(-x, y)
+    azm = math.radians(az)
+    alt = math.radians(float(altitude))
+    shaded = np.sin(alt) * np.sin(slope) + np.cos(alt) * np.cos(slope) * np.cos((azm - np.pi / 2.0) - aspect)
+    return np.clip((shaded + 1.0) / 2.0, 0.0, 1.0)
+
+
+###############################################################################
+def _savegridtotif(outfilename, arr, mask, geo, transform, resolution, colour='none', colourmin=None, colourmax=None, fill=False, shade=False, shadeazimuth=325.0, shadealtitude=15.0):
+    '''write a gridded 2d array to a GeoTIFF.  colour='none' -> single band float; 'jeca' -> RGB colour
+    ramp; 'grey' -> RGB greyscale.  Masked (empty) cells are nodata/black.  Shared by the bathymetry and
+    backscatter gridders.  When *shade* is set, a hillshade (default sun azimuth 325 deg, altitude 15 deg)
+    is blended over the colour/greyscale render to give shaded relief.'''
+    import rasterio
+    height, width = arr.shape
     log("Creating grid tif file... %s (%d x %d @ %.3f m)" % (outfilename, width, height, resolution))
 
     if colour == 'none':
@@ -463,6 +703,16 @@ def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0',
             grey = idx.astype('uint8')
             red = green = blue = grey
 
+        # blend in shaded relief (hillshade) so the colour depth raster shows topography
+        if shade:
+            base = arr.astype(float).copy()
+            if mask.any() and (~mask).any():
+                base[mask] = float(arr[~mask].mean())   # avoid cliff artefacts at the swath edge / holes
+            relief = _hillshade(base, shadeazimuth, shadealtitude, resolution)
+            red = np.clip(red.astype(float) * relief, 0, 255).astype('uint8')
+            green = np.clip(green.astype(float) * relief, 0, 255).astype('uint8')
+            blue = np.clip(blue.astype(float) * relief, 0, 255).astype('uint8')
+
         # nodata cells are rendered black
         red = np.where(mask, 0, red).astype('uint8')
         green = np.where(mask, 0, green).astype('uint8')
@@ -480,39 +730,421 @@ def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0',
 
 
 ###############################################################################
-def getfileinfo(filename):
-    '''read a .all file and return a summary dictionary of datagram counts, approximate position and a suitable EPSG code.'''
+def computeangularvariedgain(angles, backscatter, binsize=1.0):
+    '''build the Angular Varied Gain (AVG) trend for a swath of backscatter.
+
+    The seabed reflects more energy near nadir than at the outer beams, so raw backscatter has a
+    strong dependence on beam angle.  This bins every sounding by its beam angle from nadir (port
+    negative, starboard positive) and returns the mean backscatter per angle bin - the angular
+    response curve that the mosaic must be flattened against.
+
+    returns (bincentres, trend, edges); trend[i] is the mean backscatter in angle bin i (empty bins
+    are linearly interpolated from their neighbours).'''
+    binsize = float(binsize) if binsize and binsize > 0 else 1.0
+    amin = math.floor(float(angles.min()) / binsize) * binsize
+    amax = math.ceil(float(angles.max()) / binsize) * binsize
+    if amax <= amin:
+        amax = amin + binsize
+    edges = np.arange(amin, amax + binsize, binsize)
+    nbins = len(edges) - 1
+    idx = np.clip(np.digitize(angles, edges) - 1, 0, nbins - 1)
+    sums = np.bincount(idx, backscatter, nbins)
+    counts = np.bincount(idx, None, nbins)
+    trend = np.full(nbins, np.nan)
+    nonempty = counts > 0
+    trend[nonempty] = sums[nonempty] / counts[nonempty]
+    centres = edges[:-1] + binsize / 2.0
+    # fill empty bins so every sounding has a defined correction
+    if nonempty.sum() >= 2:
+        trend = np.interp(centres, centres[nonempty], trend[nonempty])
+    elif nonempty.sum() == 1:
+        trend[:] = float(trend[nonempty][0])
+    else:
+        trend[:] = 0.0
+    return centres, trend, edges
+
+
+###############################################################################
+def _loadbackscatterpoints(filename, runtime_params):
+    '''load per-beam seabed backscatter with map position and beam angle from nadir.
+
+    returns numpy arrays: east, north, backscatter (dB), angle (deg, port -ve / stbd +ve) and a
+    rejected boolean mask.  The beam angle is derived from the across-track offset and the sounding
+    depth (atan2(acrosstrack, depth)), which is the incidence angle on a locally flat seabed.'''
+    start_time = time.time()
+    maxpings = int(_get_runtime_param(runtime_params, 'debug', -1))
+    if maxpings == -1:
+        maxpings = 999999999
+
     r = allreader(filename)
-    longitude, latitude = r.getapproximatepositon()
+    statusodir = _get_runtime_param(runtime_params, 'odir', '') or os.path.dirname(os.path.abspath(filename))
+
+    epsg = str(_get_runtime_param(runtime_params, 'epsg', '0'))
+    if epsg == '0':
+        approxlongitude, approxlatitude = r.getapproximatepositon()
+        epsg = geodetic.epsgfromlonglat(approxlongitude, approxlatitude)
+        _set_runtime_param(runtime_params, 'epsg', epsg)
+    geo = geodetic.geodesy(str(epsg))
+
+    recordcount, starttimestamp, endtimestamp = r.getrecordcount("X")
+    navigation = r.loadnavigation()
+    nav = np.array(navigation)
+    tslatitude = timeseries.cTimeSeries(nav[:, 0], nav[:, 1])
+    tslongitude = timeseries.cTimeSeries(nav[:, 0], nav[:, 2])
+
+    writestatus(statusodir, state='loading', job='Backscatter AVG mosaic',
+                file=os.path.basename(filename), progress=0.0, pings=0,
+                recordcount=int(recordcount), epsg=str(epsg), elapsed=0.0)
+
+    easts, norths, bs, angles, rejected = [], [], [], [], []
+    pingcounter = 0
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram in ('X', 'D'):
+            datagram.read()
+            ts = to_timestamp(to_datetime(datagram.recorddate, datagram.time))
+            lat = tslatitude.getValueAt(ts)
+            lon = tslongitude.getValueAt(ts)
+            e0, n0 = geo.convertToGrid(lon, lat)
+            detinfo = getattr(datagram, 'detectioninformation', None)
+            rtclean = getattr(datagram, 'realtimecleaninginformation', None)
+            heading = datagram.heading
+            for idx in range(datagram.nbeams):
+                depth = datagram.depth[idx]
+                across = datagram.acrosstrackdistance[idx]
+                along = datagram.alongtrackdistance[idx]
+                e, n = geodetic.calculateGridPositionFromBearingDxDy(e0, n0, heading, across, along)
+                easts.append(e)
+                norths.append(n)
+                bs.append(datagram.reflectivity[idx])
+                angles.append(math.degrees(math.atan2(across, abs(depth))) if depth else 0.0)
+                rej = int(detinfo[idx]) if detinfo is not None else 0
+                if rtclean is not None and rtclean[idx] < 0:
+                    rej |= 0x80
+                rejected.append((rej & 0x80) != 0)
+            pingcounter += 1
+            update_progress("Backscatter AVG mosaic", pingcounter / recordcount if recordcount else 0.0)
+            _emitprogress(pingcounter / recordcount if recordcount else 0.0, "Loading backscatter")
+            writestatus(statusodir, throttle=0.5, state='processing', job='Backscatter AVG mosaic',
+                        file=os.path.basename(filename),
+                        progress=(pingcounter / recordcount) if recordcount else 0.0,
+                        pings=pingcounter, recordcount=int(recordcount), epsg=str(epsg),
+                        elapsed=time.time() - start_time)
+            if pingcounter >= maxpings:
+                break
+    r.close()
+    writestatus(statusodir, state='loaded', job='Backscatter AVG mosaic',
+                file=os.path.basename(filename), progress=1.0, pings=pingcounter,
+                recordcount=int(recordcount), epsg=str(epsg), elapsed=time.time() - start_time)
+    return (np.array(easts, dtype=float), np.array(norths, dtype=float),
+            np.array(bs, dtype=float), np.array(angles, dtype=float),
+            np.array(rejected, dtype=bool))
+
+
+###############################################################################
+def backscattertotif(filename, resolution=0.0, epsg='0', outfilename='', maxpings=-1, verbose=False, odir='', colour='grey', colourmin=None, colourmax=None, anglebinsize=1.0, keeprejected=False):
+    '''grid seabed backscatter (reflectivity) into a GeoTIFF with an Angular Varied Gain (AVG) correction.
+
+    Backscatter is NOT gridded the same way as bathymetry.  A raw mosaic shows a bright nadir stripe and
+    dark swath edges because the seabed returns more energy near nadir than at grazing angles.  This
+    method first characterises that angular response by accumulating the AVG trend (mean backscatter vs
+    beam angle from nadir, over every ping), then subtracts the trend from each sounding - normalising
+    every beam angle back to the survey mean - before gridding.  The result is a radiometrically balanced
+    backscatter mosaic with the across-track angular seam removed.
+
+    resolution    : grid cell size in metres.  0 (default) auto-computes a coarse value from beam spacing.
+    colour        : 'grey' (default) greyscale, 'jeca' colour ramp, or 'none' for a single band float tif.
+    anglebinsize  : width in degrees of the AVG angle bins. [Default: 1.0]
+    keeprejected  : keep soundings flagged as rejected. [Default: drop them]
+    returns the path to the created GeoTIFF, or None if no data could be extracted.'''
+    from rasterio.transform import from_origin
+
+    if resolution is None or float(resolution) <= 0:
+        resolution = computeapproximateresolution(filename)
+        log("Auto-computed grid resolution: %.3f m" % (resolution))
+    resolution = float(resolution)
+
+    epsg = str(epsg)
+    if epsg == '0':
+        epsg = str(getsuitableepsg(filename))
+    geo = geodetic.geodesy(str(epsg))
+
+    runtime_params = {'epsg': epsg, 'debug': str(maxpings), 'verbose': bool(verbose), 'spherical': False, 'odir': odir}
+    log("Loading seabed backscatter for AVG correction...")
+    east, north, backscatter, angles, rejected = _loadbackscatterpoints(filename, runtime_params)
+    if east.size == 0:
+        log("No backscatter extracted from %s" % (filename), error=True)
+        return None
+
+    # keep finite, non-zero soundings; drop rejected unless asked to keep them
+    keep = np.isfinite(backscatter) & np.isfinite(angles) & (backscatter != 0)
+    if not keeprejected:
+        keep &= ~rejected
+    east, north, backscatter, angles = east[keep], north[keep], backscatter[keep], angles[keep]
+    if east.size == 0:
+        log("No accepted backscatter samples to grid for %s" % (filename), error=True)
+        return None
+
+    # ---- Angular Varied Gain: characterise then flatten the across-swath angular response ----
+    centres, trend, edges = computeangularvariedgain(angles, backscatter, anglebinsize)
+    globalmean = float(np.mean(backscatter))
+    nbins = len(edges) - 1
+    binidx = np.clip(np.digitize(angles, edges) - 1, 0, nbins - 1)
+    corrected = backscatter - trend[binidx] + globalmean
+    log("Applied AVG correction over %d angle bins of %.1f deg (survey mean %.2f dB)" % (nbins, float(anglebinsize), globalmean))
+
+    arr, countarr, (xmin, ymin), (xmax, ymax) = _gridtomean(east, north, corrected, resolution)
+    mask = countarr == 0
+
+    height, width = arr.shape
+    transform = from_origin(xmin - resolution / 2.0, ymax + resolution / 2.0, resolution, resolution)
+
+    if len(outfilename) == 0:
+        rendering = colour if colour != 'none' else 'float'
+        suffix = "_backscatter_avg_%s_%gm.tif" % (rendering, resolution)
+        targetdir = odir if len(odir) > 0 else os.path.dirname(filename)
+        if len(targetdir) > 0 and not os.path.isdir(targetdir):
+            os.makedirs(targetdir, exist_ok=True)
+        outfilename = os.path.join(targetdir, os.path.basename(filename) + suffix)
+
+    out = _savegridtotif(outfilename, arr, mask, geo, transform, resolution,
+                         colour=colour, colourmin=colourmin, colourmax=colourmax)
+    writestatus(odir or os.path.dirname(filename), state='done', job='Backscatter AVG mosaic',
+                file=os.path.basename(filename), progress=1.0, epsg=str(epsg), geotiff=out)
+    return out
+
+
+###############################################################################
+def _haversinemetres(lat1, lon1, lat2, lon2):
+    '''great-circle distance between two WGS84 lat/lon points, in metres.'''
+    radius = 6378137.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2.0) ** 2
+    return 2.0 * radius * math.asin(min(1.0, math.sqrt(a)))
+
+###############################################################################
+def _initialbearingdeg(lat1, lon1, lat2, lon2):
+    '''initial great-circle bearing from point 1 to point 2, in degrees (0-360).'''
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    x = math.sin(dl) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+###############################################################################
+def _runtimeparametersdict(datagram):
+    '''build the human-friendly runtime parameter dictionary from a decoded R_RUNtime datagram.'''
+    return {
+        'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
+        'emmodel': datagram.emmodel,
+        'serialnumber': datagram.serialnumber,
+        'depthmode': datagram.depthmode,
+        'txpulseform': datagram.TXPulseForm,
+        'dualswathmode': datagram.dualSwathMode,
+        'filtersetting': datagram.filterSetting,
+        'minimumdepth': datagram.minimumdepth,
+        'maximumdepth': datagram.maximumdepth,
+        'absorptioncoefficient': datagram.absorptionCoefficient,
+        'transmitpulselength': datagram.transmitPulseLength,
+        'transmitbeamwidth': datagram.transmitBeamWidth,
+        'transmitpower': datagram.transmitPower,
+        'receivebeamwidth': datagram.receiveBeamWidth,
+        'beamspacing': datagram.beamSpacingString,
+        'maximumportwidth': datagram.maximumPortWidth,
+        'maximumportcoveragedegrees': datagram.maximumPortCoverageDegrees,
+        'maximumstbdwidth': datagram.maximumStbdWidth,
+        'maximumstbdcoveragedegrees': datagram.maximumStbdCoverageDegrees,
+        'yawstabilisation': datagram.yawAndPitchStabilisationMode,
+    }
+
+###############################################################################
+def getfileinfo(filename):
+    '''read a .all file and return a rich but lightweight summary dictionary.
+
+    It scans only the datagram headers (seeking over the bodies), decodes every position (P)
+    record inline, and decodes just ONE each of the depth (X/D), travel-time (N) and runtime (R)
+    records to report representative values.  It never decodes the full bathymetry and never writes
+    a point cloud or GeoTIFF, so it stays fast even on very large files.
+
+    Returns datagram counts, file size, first/last position, survey duration, track distance,
+    average vessel speed, course over ground, approximate water depth, centre frequency, swath
+    coverage / sector angle and a suitable projected EPSG code.'''
+    filesize = os.path.getsize(filename)
+
+    header_unpack = allreader.allpacketheader_unpack   # '=LBBHLL'
+    header_len = allreader.allpacketheader_len         # 16 bytes
+    p_struct = struct.Struct('=LBBHLLHHll4HBB')         # P record fixed part (lat=s[8], lon=s[9], sog=s[11])
+    p_size = p_struct.size
 
     counts = {}
+    positions = []          # (timestamp, lat, lon, sog_mps_or_None)
+    selecteddescriptor = None   # lock onto a single positioning system (like loadnavigation)
+    firstbytes = {}         # raw bytes of the first X/D/N/R record we meet
+    attituderph = []        # first (roll, pitch, heave) of each A record - for significant attitude
+    wanted = ('X', 'D', 'N', 'R')
     starttimestamp = 0
     endtimestamp = 0
-    recorddate = 0
-    recordtime = 0
     first = True
-    r.rewind()
-    while r.moredata():
-        numberofbytes, stx, typeofdatagram, emmodel, recorddate, recordtime = r.readdatagramheader()
-        r.fileptr.seek(numberofbytes, 1)
-        if first:
-            starttimestamp = to_timestamp(to_datetime(recorddate, recordtime))
-            first = False
-        counts[typeofdatagram] = counts.get(typeofdatagram, 0) + 1
-    if not first:
-        endtimestamp = to_timestamp(to_datetime(recorddate, recordtime))
-    r.rewind()
-    r.close()
+
+    with open(filename, 'rb') as f:
+        pos = 0
+        while pos + header_len <= filesize:
+            f.seek(pos, 0)
+            head = f.read(header_len)
+            if len(head) < header_len:
+                break
+            try:
+                s = header_unpack(head)
+            except struct.error:
+                break
+
+            numberofbytes = s[0] + 4
+            typeofdatagram = chr(s[2])
+            recorddate = s[4]
+            recordtime = float(s[5] / 1000.0)
+
+            # stop on a corrupt / truncated trailing record rather than mis-scanning
+            if numberofbytes < header_len or pos + numberofbytes > filesize:
+                break
+
+            ts = to_timestamp(to_datetime(recorddate, recordtime))
+            if first:
+                starttimestamp = ts
+                first = False
+            endtimestamp = ts
+            counts[typeofdatagram] = counts.get(typeofdatagram, 0) + 1
+
+            if typeofdatagram == 'P' and numberofbytes >= p_size:
+                ps = p_struct.unpack(head + f.read(p_size - header_len))
+                lat = ps[8] / 20000000.0
+                lon = ps[9] / 10000000.0
+                descriptor = ps[14]
+                if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                    # only keep one positioning system so the track does not zig-zag between sources
+                    if selecteddescriptor is None:
+                        selecteddescriptor = descriptor
+                    if descriptor == selecteddescriptor:
+                        sog = ps[11] / 100.0 if ps[11] != 65535 else None   # 65535 == not available
+                        positions.append((ts, lat, lon, sog))
+            elif typeofdatagram in wanted and typeofdatagram not in firstbytes:
+                f.seek(pos, 0)
+                firstbytes[typeofdatagram] = f.read(numberofbytes)
+            elif typeofdatagram == 'A' and numberofbytes >= 32:
+                # take just the first entry's roll/pitch/heave (int16 @ offsets 26/28/30, 0.01 units)
+                arec = head + f.read(32 - header_len)
+                if struct.unpack_from('=H', arec, 20)[0] > 0:
+                    attituderph.append(struct.unpack_from('=hhh', arec, 26))
+
+            pos += numberofbytes
+
+    # ---- positions / track ----
+    longitude = positions[0][2] if positions else 0.0
+    latitude = positions[0][1] if positions else 0.0
+    firstposition = None
+    lastposition = None
+    trackmetres = 0.0
+    meanspeed_mps = 0.0
+    course_deg = None
+    if positions:
+        firstposition = {'timestamp': positions[0][0], 'latitude': positions[0][1], 'longitude': positions[0][2]}
+        lastposition = {'timestamp': positions[-1][0], 'latitude': positions[-1][1], 'longitude': positions[-1][2]}
+        for i in range(1, len(positions)):
+            trackmetres += _haversinemetres(positions[i - 1][1], positions[i - 1][2], positions[i][1], positions[i][2])
+        sogs = [p[3] for p in positions if p[3]]
+        if sogs:
+            meanspeed_mps = sum(sogs) / len(sogs)
+        course_deg = _initialbearingdeg(positions[0][1], positions[0][2], positions[-1][1], positions[-1][2])
+
+    durationseconds = (endtimestamp - starttimestamp) if (endtimestamp and starttimestamp) else 0.0
+    if meanspeed_mps == 0.0 and durationseconds > 0:
+        meanspeed_mps = trackmetres / durationseconds
+
+    # ---- sample one of each interesting record (no full bathy processing) ----
+    def _decode(recbytes, cls):
+        dg = cls(io.BytesIO(recbytes), len(recbytes))
+        dg.read()
+        return dg
+
+    approxdepth = None
+    centrefrequency = None
+    depthmode = None
+    portcoverage = None
+    stbdcoverage = None
+    runtimeparameters = None
+
+    depthbytes = firstbytes.get('X') or firstbytes.get('D')
+    if depthbytes:
+        try:
+            dg = _decode(depthbytes, X_depth if firstbytes.get('X') else D_depth)
+            depths = sorted(d for d in dg.depth if d and d == d)   # drop zero / NaN
+            if depths:
+                approxdepth = depths[len(depths) // 2]              # median sounding
+        except Exception:
+            pass
+
+    if firstbytes.get('N'):
+        try:
+            dg = _decode(firstbytes['N'], N_TRAVELtime)
+            if dg.centrefrequency and dg.centrefrequency[0]:
+                centrefrequency = float(dg.centrefrequency[0])
+        except Exception:
+            pass
+
+    if firstbytes.get('R'):
+        try:
+            dg = _decode(firstbytes['R'], R_RUNtime)
+            depthmode = dg.depthmode
+            portcoverage = dg.maximumPortCoverageDegrees
+            stbdcoverage = dg.maximumStbdCoverageDegrees
+            runtimeparameters = _runtimeparametersdict(dg)
+        except Exception:
+            pass
+
+    swathcoverage = None
+    if portcoverage is not None and stbdcoverage is not None:
+        swathcoverage = portcoverage + stbdcoverage
+
+    # ---- significant attitude (4 x standard deviation of the per-record heave/roll/pitch) ----
+    significantwaveheight = significantroll = significantpitch = None
+    if attituderph:
+        rph = np.asarray(attituderph, dtype=np.float64) / 100.0   # roll, pitch (deg), heave (m)
+        std = np.std(rph, axis=0)
+        significantroll = 4.0 * float(std[0])
+        significantpitch = 4.0 * float(std[1])
+        significantwaveheight = 4.0 * float(std[2])
 
     epsg = geodetic.epsgfromlonglat(longitude, latitude)
     info = {
         'filename': filename,
-        'filesize': os.path.getsize(filename),
+        'filesize': filesize,
         'approxlongitude': longitude,
         'approxlatitude': latitude,
         'epsg': str(epsg),
         'starttimestamp': starttimestamp,
         'endtimestamp': endtimestamp,
+        'durationseconds': durationseconds,
+        'firstposition': firstposition,
+        'lastposition': lastposition,
+        'positioncount': len(positions),
+        'trackdistancemetres': trackmetres,
+        'trackdistancenauticalmiles': trackmetres / 1852.0,
+        'vesselspeedmps': meanspeed_mps,
+        'vesselspeedknots': meanspeed_mps * 1.943844,
+        'courseovergrounddegrees': course_deg,
+        'approxwaterdepthm': approxdepth,
+        'centrefrequencyhz': centrefrequency,
+        'depthmode': depthmode,
+        'portcoveragedegrees': portcoverage,
+        'stbdcoveragedegrees': stbdcoverage,
+        'swathcoveragedegrees': swathcoverage,
+        'significantwaveheightm': significantwaveheight,
+        'significantrolldegrees': significantroll,
+        'significantpitchdegrees': significantpitch,
+        'runtimeparameters': runtimeparameters,
         'datagramcounts': counts,
     }
     return info
@@ -558,6 +1190,76 @@ def loadattitude(filename):
             for a in datagram.Attitude:
                 # a = [recorddate, time(sec), status, roll, pitch, heave, heading]
                 rows.append([to_timestamp(to_datetime(a[0], a[1])), a[3], a[4], a[5], a[6]])
+    r.close()
+    if len(rows) == 0:
+        return np.empty((0, 5), dtype=float)
+    return np.array(rows, dtype=float)
+
+###############################################################################
+def loadattitudefirst(filename):
+    '''return one (roll, pitch, heave) sample per attitude (A) datagram as an (N, 3) numpy array (degrees, degrees, metres).
+
+    For significant roll/pitch/heave we only need a representative time series, so this takes the
+    first observation in each attitude record rather than decoding every entry.  Only the datagram
+    header plus the first entry (34 bytes) is read per record - no per-entry parsing or numpy
+    reshaping - and roll, pitch and heave all come out of that single read, which makes it far
+    faster than loadattitude on large files.
+
+    The A datagram layout is: header '=LBBHLLHHH' (22 bytes, numberentries at offset 20) followed by
+    fixed 12-byte entries '=HHhhhH' (time, status, roll, pitch, heave, heading), each value in 0.01
+    units.  In the first entry roll/pitch/heave (int16) therefore sit at byte offsets 26, 28 and 30.'''
+    rph = struct.Struct('=hhh')  # roll, pitch, heave of the first entry (offset 26)
+    r = allreader(filename)
+    rows = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'A':
+            head = r.readdatagrambytes(datagram.offset, 32)
+            if len(head) >= 32 and struct.unpack_from('=H', head, 20)[0] > 0:
+                rows.append(rph.unpack_from(head, 26))
+    r.close()
+    if len(rows) == 0:
+        return np.empty((0, 3), dtype=float)
+    return np.asarray(rows, dtype=np.float64) / 100.0
+
+###############################################################################
+def significantattitude(filename):
+    '''estimate the significant roll, pitch and wave height (heave) from the attitude (A) time series
+    using the 4 x standard deviation method:  significant value = 4 * sigma.  All three are computed
+    from a single fast pass that takes one observation per attitude record (see loadattitudefirst).
+
+    Returns a dict with significantwaveheight / significantroll / significantpitch (the 4 x sigma
+    estimates, metres and degrees) plus the sample count.'''
+    rph = loadattitudefirst(filename)
+    n = int(rph.shape[0])
+    if n == 0:
+        return {'samples': 0, 'significantwaveheight': None,
+                'significantroll': None, 'significantpitch': None}
+    std = np.std(rph, axis=0)  # [roll, pitch, heave]
+    return {
+        'samples': n,
+        'significantwaveheight': 4.0 * float(std[2]),
+        'significantroll': 4.0 * float(std[0]),
+        'significantpitch': 4.0 * float(std[1]),
+    }
+
+###############################################################################
+def loadnetworkattitude(filename):
+    '''return all network attitude (n) observations as a numpy array with columns
+    [timestamp, roll, pitch, heave, heading].  This is the efficient way to pull the network
+    attitude out of the file - it skips the per-entry raw input telegram bytes that the
+    n_ATTITUDE.Attitude list carries.'''
+    r = allreader(filename)
+    rows = []
+    r.rewind()
+    while r.moredata():
+        typeofdatagram, datagram = r.readdatagram()
+        if typeofdatagram == 'n':
+            datagram.read()
+            for a in datagram.Attitude:
+                # a = [recorddate, time(sec), roll, pitch, heave, heading, telegrambytes]
+                rows.append([to_timestamp(to_datetime(a[0], a[1])), a[2], a[3], a[4], a[5]])
     r.close()
     if len(rows) == 0:
         return np.empty((0, 5), dtype=float)
@@ -657,28 +1359,7 @@ def loadruntimeparameters(filename):
         typeofdatagram, datagram = r.readdatagram()
         if typeofdatagram == 'R':
             datagram.read()
-            out.append({
-                'timestamp': to_timestamp(to_datetime(datagram.recorddate, datagram.time)),
-                'emmodel': datagram.emmodel,
-                'serialnumber': datagram.serialnumber,
-                'depthmode': datagram.depthmode,
-                'txpulseform': datagram.TXPulseForm,
-                'dualswathmode': datagram.dualSwathMode,
-                'filtersetting': datagram.filterSetting,
-                'minimumdepth': datagram.minimumdepth,
-                'maximumdepth': datagram.maximumdepth,
-                'absorptioncoefficient': datagram.absorptionCoefficient,
-                'transmitpulselength': datagram.transmitPulseLength,
-                'transmitbeamwidth': datagram.transmitBeamWidth,
-                'transmitpower': datagram.transmitPower,
-                'receivebeamwidth': datagram.receiveBeamWidth,
-                'beamspacing': datagram.beamSpacingString,
-                'maximumportwidth': datagram.maximumPortWidth,
-                'maximumportcoveragedegrees': datagram.maximumPortCoverageDegrees,
-                'maximumstbdwidth': datagram.maximumStbdWidth,
-                'maximumstbdcoveragedegrees': datagram.maximumStbdCoverageDegrees,
-                'yawstabilisation': datagram.yawAndPitchStabilisationMode,
-            })
+            out.append(_runtimeparametersdict(datagram))
     r.close()
     return out
 
@@ -1246,6 +1927,9 @@ class allreader:
 
 ###############################################################################
 class cbeam:
+    __slots__ = ('sortingDirection', 'detectionInfo', 'numberOfSamplesPerBeam',
+                 'centreSampleNumber', 'sector', 'takeOffAngle', 'sampleSum', 'samples')
+
     def __init__(self, beamDetail, angle):
         self.sortingDirection = beamDetail[0]
         self.detectionInfo = beamDetail[1]
@@ -1358,10 +2042,11 @@ class A_ATTITUDE:
 ###############################################################################
     def read(self):
         self.fileptr.seek(self.offset, 0)
-        rec_fmt = '=LBBHLLHHH'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack_from
-        s = rec_unpack(self.fileptr.read(rec_len))
+        # read the whole datagram once and parse it from the buffer (entries are fixed size).
+        raw = self.fileptr.read(self.numberofbytes)
+
+        hdr = struct.Struct('=LBBHLLHHH')
+        s = hdr.unpack_from(raw, 0)
 
         # self.numberofbytes= s[0]
         self.stx = s[1]
@@ -1373,28 +2058,18 @@ class A_ATTITUDE:
         self.serialnumber = s[7]
         self.numberentries = s[8]
 
-        rec_fmt = '=HHhhhH'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack
+        # decode all fixed-size entries in one pass with iter_unpack (was a per-entry file read)
+        entry = struct.Struct('=HHhhhH')
+        pos = hdr.size
+        recorddate = self.recorddate
+        basetime = self.time
+        # entry = time, status, roll, pitch, heave, heading
+        self.Attitude = [[recorddate, basetime + e[0]/1000.0, e[1],
+                          e[2]/100.0, e[3]/100.0, e[4]/100.0, e[5]/100.0]
+                         for e in entry.iter_unpack(raw[pos:pos + entry.size * self.numberentries])]
+        pos += entry.size * self.numberentries
 
-        # we need to store all the attitude data in a list
-        self.Attitude = [0 for i in range(self.numberentries)]
-
-        i = 0
-        while i < self.numberentries:
-            data = self.fileptr.read(rec_len)
-            s = rec_unpack(data)
-            # time,status,roll,pitch,heave,heading
-            self.Attitude[i] = [self.recorddate, self.time +
-                                float(s[0]/1000.0), s[1], s[2]/100.0, s[3]/100.0, s[4]/100.0, s[5]/100.0]
-            i = i + 1
-
-        rec_fmt = '=BBH'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack_from
-        data = self.fileptr.read(rec_len)
-        s = rec_unpack(data)
-
+        s = struct.unpack_from('=BBH', raw, pos)
         self.systemdescriptor = s[0]
         self.etx = s[1]
         self.checksum = s[2]
@@ -1477,48 +2152,26 @@ class D_depth:
         self.xyresolution = float(s[14] / float(100))
         self.samplefrequency = s[15]
 
-        self.depth = [0 for i in range(self.nbeams)]
-        self.acrosstrackdistance = [0 for i in range(self.nbeams)]
-        self.alongtrackdistance = [0 for i in range(self.nbeams)]
-        self.beamdepressionangle = [0 for i in range(self.nbeams)]
-        self.beamazmuthangle = [0 for i in range(self.nbeams)]
-        self.range = [0 for i in range(self.nbeams)]
-        self.qualityfactor = [0 for i in range(self.nbeams)]
-        self.lengthofdetectionwindow = [0 for i in range(self.nbeams)]
-        self.reflectivity = [0 for i in range(self.nbeams)]
-        self.beamnumber = [0 for i in range(self.nbeams)]
-
-        # now read the variable part of the Record
+        # decode every beam in a single block read + iter_unpack, then split into per-field
+        # columns with one C-level zip (replaces the original per-beam read/unpack hot loop).
         if self.emmodel < 700:
-            rec_fmt = '=H3h2H2BbB'
+            beam_struct = struct.Struct('=H3h2H2BbB')
         else:
-            rec_fmt = '=4h2H2BbB'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack
+            beam_struct = struct.Struct('=4h2H2BbB')
+        beamdata = self.fileptr.read(beam_struct.size * self.nbeams)
+        columns = list(zip(*beam_struct.iter_unpack(beamdata))) or [()] * 10
 
-        i = 0
-        while i < self.nbeams:
-            data = self.fileptr.read(rec_len)
-            s = rec_unpack(data)
-            self.depth[i] = float(s[0] / float(100))
-            self.acrosstrackdistance[i] = float(s[1] / float(100))
-            self.alongtrackdistance[i] = float(s[2] / float(100))
-            self.beamdepressionangle[i] = float(s[3] / float(100))
-            self.beamazmuthangle[i] = float(s[4] / float(100))
-            self.range[i] = float(s[5] / float(100))
-            self.qualityfactor[i] = s[6]
-            self.lengthofdetectionwindow[i] = s[7]
-            self.reflectivity[i] = float(s[8] / float(100))
-            self.beamnumber[i] = s[9]
-
-            # now do some sanity checks.  We have examples where the depth and Across track values are NaN
-            if (math.isnan(self.depth[i])):
-                self.depth[i] = 0
-            if (math.isnan(self.acrosstrackdistance[i])):
-                self.acrosstrackdistance[i] = 0
-            if (math.isnan(self.alongtrackdistance[i])):
-                self.alongtrackdistance[i] = 0
-            i = i + 1
+        # depth, acrosstrack and alongtrack keep the original NaN guard (NaN != NaN)
+        self.depth = [0.0 if x != x else x for x in (v / 100.0 for v in columns[0])]
+        self.acrosstrackdistance = [0.0 if x != x else x for x in (v / 100.0 for v in columns[1])]
+        self.alongtrackdistance = [0.0 if x != x else x for x in (v / 100.0 for v in columns[2])]
+        self.beamdepressionangle = [v / 100.0 for v in columns[3]]
+        self.beamazmuthangle = [v / 100.0 for v in columns[4]]
+        self.range = [v / 100.0 for v in columns[5]]
+        self.qualityfactor = list(columns[6])
+        self.lengthofdetectionwindow = list(columns[7])
+        self.reflectivity = [v / 100.0 for v in columns[8]]
+        self.beamnumber = list(columns[9])
 
         rec_fmt = '=bBH'
         rec_len = struct.calcsize(rec_fmt)
@@ -1695,54 +2348,34 @@ class f_RAWrange:
             0 for i in range(self.NumTransmitSector)]
         self.SignalBandwidth = [0 for i in range(self.NumTransmitSector)]
 
-        self.BeamPointingAngle = [0 for i in range(self.NumReceiveBeams)]
-        self.TransmitSectorNumber = [0 for i in range(self.NumReceiveBeams)]
-        self.DetectionInfo = [0 for i in range(self.NumReceiveBeams)]
-        self.DetectionWindow = [0 for i in range(self.NumReceiveBeams)]
-        self.qualityfactor = [0 for i in range(self.NumReceiveBeams)]
-        self.DCorr = [0 for i in range(self.NumReceiveBeams)]
-        self.TwoWayTraveltime = [0 for i in range(self.NumReceiveBeams)]
-        self.reflectivity = [0 for i in range(self.NumReceiveBeams)]
-        self.realtimecleaninginformation = [
-            0 for i in range(self.NumReceiveBeams)]
-        self.Spare = [0 for i in range(self.NumReceiveBeams)]
-        self.beamnumber = [0 for i in range(self.NumReceiveBeams)]
-
         # # now read the variable part of the Transmit Record
         rec_fmt = '=hHLLLHBB'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack
+        tx_struct = struct.Struct(rec_fmt)
+        txdata = self.fileptr.read(tx_struct.size * self.NumTransmitSector)
+        bytesRead += tx_struct.size * self.NumTransmitSector
+        txcols = list(zip(*tx_struct.iter_unpack(txdata))) or [()] * 8
+        self.TiltAngle = [v / 100.0 for v in txcols[0]]
+        self.Focusrange = [v / 10 for v in txcols[1]]
+        self.SignalLength = list(txcols[2])
+        self.SectorTransmitDelay = list(txcols[3])
+        self.centrefrequency = list(txcols[4])
+        self.SignalBandwidth = list(txcols[5])
+        self.SignalWaveformID = list(txcols[6])
+        self.TransmitSectorNumberTX = list(txcols[7])
 
-        for i in range(self.NumTransmitSector):
-            data = self.fileptr.read(rec_len)
-            bytesRead += rec_len
-            s = rec_unpack(data)
-            self.TiltAngle[i] = float(s[0]) / 100.0
-            self.Focusrange[i] = s[1] / 10
-            self.SignalLength[i] = s[2]
-            self.SectorTransmitDelay[i] = s[3]
-            self.centrefrequency[i] = s[4]
-            self.SignalBandwidth[i] = s[5]
-            self.SignalWaveformID[i] = s[6]
-            self.TransmitSectorNumberTX[i] = s[7]
-
-        # now read the variable part of the recieve record
-        rx_rec_fmt = '=hHBbBBhH'
-        rx_rec_len = struct.calcsize(rx_rec_fmt)
-        rx_rec_unpack = struct.Struct(rx_rec_fmt).unpack
-
-        for i in range(self.NumReceiveBeams):
-            data = self.fileptr.read(rx_rec_len)
-            rx_s = rx_rec_unpack(data)
-            bytesRead += rx_rec_len
-            self.BeamPointingAngle[i] = float(rx_s[0]) / 100.0
-            self.TwoWayTraveltime[i] = float(
-                rx_s[1]) / (4 * self.samplefrequency)
-            self.TransmitSectorNumber[i] = rx_s[2]
-            self.reflectivity[i] = rx_s[3] / 2.0
-            self.qualityfactor[i] = rx_s[4]
-            self.DetectionWindow[i] = rx_s[5]
-            self.beamnumber[i] = rx_s[6]
+        # now read the receive record - one block read + zip transpose (was a per-beam loop)
+        rx_struct = struct.Struct('=hHBbBBhH')
+        rxdata = self.fileptr.read(rx_struct.size * self.NumReceiveBeams)
+        bytesRead += rx_struct.size * self.NumReceiveBeams
+        rxcols = list(zip(*rx_struct.iter_unpack(rxdata))) or [()] * 8
+        sf4 = 4 * self.samplefrequency
+        self.BeamPointingAngle = [v / 100.0 for v in rxcols[0]]
+        self.TwoWayTraveltime = [v / sf4 for v in rxcols[1]]
+        self.TransmitSectorNumber = list(rxcols[2])
+        self.reflectivity = [v / 2.0 for v in rxcols[3]]
+        self.qualityfactor = list(rxcols[4])
+        self.DetectionWindow = list(rxcols[5])
+        self.beamnumber = list(rxcols[6])
 
         rec_fmt = '=BBH'
         rec_len = struct.calcsize(rec_fmt)
@@ -1961,10 +2594,13 @@ class n_ATTITUDE:
 ###############################################################################
     def read(self):
         self.fileptr.seek(self.offset, 0)
-        rec_fmt = '=LBBHLLHHHbB'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack_from
-        s = rec_unpack(self.fileptr.read(rec_len))
+        # read the whole datagram once and parse it from the buffer.  each attitude entry is a
+        # fixed 12-byte header followed by a variable length input telegram, so unpack_from with a
+        # running offset replaces the original two file reads per entry.
+        raw = self.fileptr.read(self.numberofbytes)
+
+        hdr = struct.Struct('=LBBHLLHHHbB')
+        s = hdr.unpack_from(raw, 0)
 
         # self.numberofbytes= s[0]
         self.stx = s[1]
@@ -1977,32 +2613,29 @@ class n_ATTITUDE:
         self.numberentries = s[8]
         self.Systemdescriptor = s[9]
 
-        rec_fmt = '=HhhhHB'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack
+        entry = struct.Struct('=HhhhHB')
+        entry_unpack = entry.unpack_from
+        entry_size = entry.size
+        pos = hdr.size
+        recorddate = self.recorddate
+        basetime = self.time
 
-        # we need to store all the attitude data in a list
-        self.Attitude = [0 for i in range(self.numberentries)]
+        attitude = []
+        for _ in range(self.numberentries):
+            e = entry_unpack(raw, pos)
+            pos += entry_size
+            inputTelegramSize = e[5]
+            data = raw[pos:pos + inputTelegramSize]
+            pos += inputTelegramSize
+            # entry layout: [recorddate, time, roll, pitch, heave, heading, input-telegram bytes]
+            # roll/pitch/heave/heading are all in 0.01 units (e[5] is the telegram byte count, not a
+            # sensor value, so it is used to slice the telegram above rather than stored as data).
+            attitude.append([recorddate, basetime + e[0]/1000,
+                             e[1]/100.0, e[2]/100.0, e[3]/100.0, e[4]/100.0, data])
+        self.Attitude = attitude
 
-        i = 0
-        while i < self.numberentries:
-            data = self.fileptr.read(rec_len)
-            s = rec_unpack(data)
-            inputTelegramSize = s[5]
-            data = self.fileptr.read(inputTelegramSize)
-            self.Attitude[i] = [self.recorddate, self.time + s[0]/1000,
-                                s[1], s[2]/100.0, s[3]/100.0, s[4]/100.0, s[5]/100.0, data]
-            i = i + 1
-
-        # # now spare byte only if necessary
-        # if self.numberofbytes % 2 != 0:
-        # self.fileptr.read(1)
-
-        # read an empty byte
-        self.fileptr.read(1)
-
-        # now read the footer
-        self.etx, self.checksum = readfooter(self.numberofbytes, self.fileptr)
+        # footer layout at the end of the record: [spare byte][etx][checksum]
+        self.etx, self.checksum = struct.unpack_from('=BH', raw, len(raw) - 3)
 
 ###############################################################################
 class N_TRAVELtime:
@@ -2049,18 +2682,6 @@ class N_TRAVELtime:
             0 for i in range(self.NumTransmitSector)]
         self.SignalBandwidth = [0 for i in range(self.NumTransmitSector)]
 
-        self.BeamPointingAngle = [0 for i in range(self.NumReceiveBeams)]
-        self.TransmitSectorNumber = [0 for i in range(self.NumReceiveBeams)]
-        self.DetectionInfo = [0 for i in range(self.NumReceiveBeams)]
-        self.DetectionWindow = [0 for i in range(self.NumReceiveBeams)]
-        self.qualityfactor = [0 for i in range(self.NumReceiveBeams)]
-        self.DCorr = [0 for i in range(self.NumReceiveBeams)]
-        self.TwoWayTraveltime = [0 for i in range(self.NumReceiveBeams)]
-        self.reflectivity = [0 for i in range(self.NumReceiveBeams)]
-        self.realtimecleaninginformation = [
-            0 for i in range(self.NumReceiveBeams)]
-        self.Spare = [0 for i in range(self.NumReceiveBeams)]
-
         # # now read the variable part of the Transmit Record
         rec_fmt = '=hHfffHBBf'
         rec_len = struct.calcsize(rec_fmt)
@@ -2079,25 +2700,21 @@ class N_TRAVELtime:
             self.TransmitSectorNumberTX[i] = s[7]
             self.SignalBandwidth[i] = float(s[8])
 
-        # now read the variable part of the recieve record
-        rx_rec_fmt = '=hBBHBbfhbB'
-        rx_rec_len = struct.calcsize(rx_rec_fmt)
-        rx_rec_unpack = struct.Struct(rx_rec_fmt).unpack
-
-        for i in range(self.NumReceiveBeams):
-            data = self.fileptr.read(rx_rec_len)
-            rx_s = rx_rec_unpack(data)
-            bytesRead += rx_rec_len
-            self.BeamPointingAngle[i] = float(rx_s[0]) / float(100)
-            self.TransmitSectorNumber[i] = rx_s[1]
-            self.DetectionInfo[i] = rx_s[2]
-            self.DetectionWindow[i] = rx_s[3]
-            self.qualityfactor[i] = rx_s[4]
-            self.DCorr[i] = rx_s[5]
-            self.TwoWayTraveltime[i] = float(rx_s[6])
-            self.reflectivity[i] = rx_s[7]
-            self.realtimecleaninginformation[i] = rx_s[8]
-            self.Spare[i] = rx_s[9]
+        # now read the receive record - one block read + zip transpose (was a per-beam loop)
+        rx_struct = struct.Struct('=hBBHBbfhbB')
+        rxdata = self.fileptr.read(rx_struct.size * self.NumReceiveBeams)
+        bytesRead += rx_struct.size * self.NumReceiveBeams
+        rxcols = list(zip(*rx_struct.iter_unpack(rxdata))) or [()] * 10
+        self.BeamPointingAngle = [v / 100.0 for v in rxcols[0]]
+        self.TransmitSectorNumber = list(rxcols[1])
+        self.DetectionInfo = list(rxcols[2])
+        self.DetectionWindow = list(rxcols[3])
+        self.qualityfactor = list(rxcols[4])
+        self.DCorr = list(rxcols[5])
+        self.TwoWayTraveltime = list(rxcols[6])
+        self.reflectivity = list(rxcols[7])
+        self.realtimecleaninginformation = list(rxcols[8])
+        self.Spare = list(rxcols[9])
 
         rec_fmt = '=BBH'
         rec_len = struct.calcsize(rec_fmt)
@@ -2665,46 +3282,28 @@ class X_depth:
         self.spare2 = s[16]
         self.spare3 = s[17]
 
-        self.depth = [0 for i in range(self.nbeams)]
-        self.acrosstrackdistance = [0 for i in range(self.nbeams)]
-        self.alongtrackdistance = [0 for i in range(self.nbeams)]
-        self.detectionwindowslength = [0 for i in range(self.nbeams)]
-        self.qualityfactor = [0 for i in range(self.nbeams)]
-        self.beamincidenceangleadjustment = [0 for i in range(self.nbeams)]
-        self.detectioninformation = [0 for i in range(self.nbeams)]
-        self.realtimecleaninginformation = [0 for i in range(self.nbeams)]
-        self.reflectivity = [0 for i in range(self.nbeams)]
+        # read every beam in a single block and decode it with iter_unpack.  this replaces the
+        # original per-beam file read + struct.unpack hot loop, which dominated the profile.
+        beam_struct = struct.Struct('=fffHBBBbh')
+        beamdata = self.fileptr.read(beam_struct.size * self.nbeams)
 
-        # # now read the variable part of the Record
-        rec_fmt = '=fffHBBBbh'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack
-        for i in range(self.nbeams):
-            data = self.fileptr.read(rec_len)
-            s = rec_unpack(data)
-            self.depth[i] = s[0]
-            self.acrosstrackdistance[i] = s[1]
-            self.alongtrackdistance[i] = s[2]
-            self.detectionwindowslength[i] = s[3]
-            self.qualityfactor[i] = s[4]
-            self.beamincidenceangleadjustment[i] = float(s[5] / 10)
-            self.detectioninformation[i] = s[6]
-            self.realtimecleaninginformation[i] = s[7]
-            self.reflectivity[i] = float(s[8] / 10)
+        # transpose the decoded beams into per-field columns with a single C-level zip,
+        # then build each list in one comprehension (far cheaper than per-beam appends).
+        columns = list(zip(*beam_struct.iter_unpack(beamdata))) or [()] * 9
 
-            # now do some sanity checks.  We have examples where the depth and Across track values are NaN
-            if (math.isnan(self.depth[i])):
-                self.depth[i] = 0
-            if (math.isnan(self.acrosstrackdistance[i])):
-                self.acrosstrackdistance[i] = 0
-            if (math.isnan(self.alongtrackdistance[i])):
-                self.alongtrackdistance[i] = 0
+        # NaN is the only value that is not equal to itself - cheaper than calling math.isnan
+        self.depth = [0.0 if v != v else v for v in columns[0]]
+        self.acrosstrackdistance = [0.0 if v != v else v for v in columns[1]]
+        self.alongtrackdistance = [0.0 if v != v else v for v in columns[2]]
+        self.detectionwindowslength = list(columns[3])
+        self.qualityfactor = list(columns[4])
+        self.beamincidenceangleadjustment = [v / 10.0 for v in columns[5]]
+        self.detectioninformation = list(columns[6])
+        self.realtimecleaninginformation = list(columns[7])
+        self.reflectivity = [v / 10.0 for v in columns[8]]
 
-        rec_fmt = '=BBH'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack_from
-        data = self.fileptr.read(rec_len)
-        s = rec_unpack(data)
+        rec_unpack = struct.Struct('=BBH').unpack_from
+        s = rec_unpack(self.fileptr.read(4))
 
         self.etx = s[1]
         self.checksum = s[2]
@@ -2763,14 +3362,17 @@ class Y_SEABEDIMAGE:
         self.data = ""
         self.ARC = {}
         self.BeamPointingAngle = []
+        self._beams = None
+        self._beamcols = None
 
 ###############################################################################
     def read(self):
         self.fileptr.seek(self.offset, 0)
-        rec_fmt = '=LBBHLLHHfHhhHHH'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack_from
-        s = rec_unpack(self.fileptr.read(rec_len))
+        # read the whole datagram once and parse beam descriptors + samples from the buffer.
+        raw = self.fileptr.read(self.numberofbytes)
+
+        hdr = struct.Struct('=LBBHLLHHfHhhHHH')
+        s = hdr.unpack_from(raw, 0)
 
         # self.numberofbytes= s[0]
         self.stx = s[1]
@@ -2787,38 +3389,45 @@ class Y_SEABEDIMAGE:
         self.TxBeamWidth = s[12]
         self.TVGCrossOver = s[13]
         self.NumBeams = s[14]
-        self.beams = []
-        self.numSamples = 0
-        self.samples = []
 
-        rec_fmt = '=bBHH'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack
+        # decode the beam descriptors into columns once.  building the per-beam cbeam objects
+        # (and slicing the samples per beam) is deferred to the lazy 'beams' property because the
+        # common consumers (loadseabedimage / get_seabed_image) only need numSamples and samples.
+        beamstruct = struct.Struct('=bBHH')
+        pos = hdr.size
+        cols = list(zip(*beamstruct.iter_unpack(raw[pos:pos + beamstruct.size * self.NumBeams]))) or [(), (), (), ()]
+        self._beamcols = cols
+        self._beams = None
+        self.numSamples = sum(cols[2])
+        pos += beamstruct.size * self.NumBeams
 
-        self.numSamples = 0
-        for i in range(self.NumBeams):
-            s = rec_unpack(self.fileptr.read(rec_len))
-            b = cbeam(s, 0)
-            self.numSamples = self.numSamples + b.numberOfSamplesPerBeam
-            self.beams.append(b)
+        # all backscatter samples follow as int16 (0.1 dB)
+        self.samples = struct.unpack_from('=%dh' % self.numSamples, raw, pos) if self.numSamples else ()
 
-        rec_fmt = '=' + str(self.numSamples) + 'h'
-        rec_len = struct.calcsize(rec_fmt)
-        rec_unpack = struct.Struct(rec_fmt).unpack
-        self.samples = rec_unpack(self.fileptr.read(rec_len))
+        # footer layout at the end of the record: [spare byte][etx][checksum]
+        self.etx, self.checksum = struct.unpack_from('=BH', raw, len(raw) - 3)
 
-        # allocate the samples to the correct beams so it is easier to use
-        sampleIDX = 0
-        for b in self.beams:
-            b.samples = self.samples[sampleIDX: sampleIDX +
-                                     b.numberOfSamplesPerBeam]
-            sampleIDX = sampleIDX + b.numberOfSamplesPerBeam
+###############################################################################
+    @property
+    def beams(self):
+        '''cbeam objects (each with its samples) built on demand from the decoded columns.'''
+        if self._beams is None:
+            cols = self._beamcols or [(), (), (), ()]
+            samples = self.samples
+            beams = []
+            idx = 0
+            for sd, di, nsamp, csn in zip(cols[0], cols[1], cols[2], cols[3]):
+                b = cbeam((sd, di, nsamp, csn), 0)
+                b.samples = samples[idx: idx + nsamp]
+                idx += nsamp
+                beams.append(b)
+            self._beams = beams
+        return self._beams
 
-        # read an empty byte
-        self.fileptr.read(1)
-
-        # now read the footer
-        self.etx, self.checksum = readfooter(self.numberofbytes, self.fileptr)
+###############################################################################
+    @beams.setter
+    def beams(self, value):
+        self._beams = value
 
 ###############################################################################
     def encode(self):
