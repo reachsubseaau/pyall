@@ -1,4 +1,4 @@
-# docker-compose for the pyall MCP server.
+# docker-compose for the qc.all MCP server.
 #
 #   docker compose up -d           # build (first time) and start in the background
 #   docker compose logs -f         # follow the startup banner / processing log
@@ -7,10 +7,10 @@
 # Edit the volume below to point at your survey data folder on the host.
 
 services:
-  pyall-mcp:
+  qcall-mcp:
     build: .
-    image: pyall-mcp
-    container_name: pyall-mcp
+    image: qcall-mcp
+    container_name: qcall-mcp
     restart: unless-stopped
     ports:
       - "8000:8000"            # host:container - the MCP endpoint is http://<host>:8000/mcp
@@ -18,9 +18,14 @@ services:
       # Map the host folder holding your .all files to /data inside the container.
       # Use ":ro" to make it read-only if the server only needs to read data.
       - ./sample:/data
+      # Additional survey data drive (host E:) exposed read-only at /mnt/e so the
+      # server can reach files such as /mnt/e/sampledata/all/ without uploading.
+      - e:/:/mnt/e:rw
     environment:
-      PYALL_MCP_TRANSPORT: http
-      PYALL_MCP_HOST: 0.0.0.0
-      PYALL_MCP_PORT: "8000"
-      PYALL_MCP_ROOT: /data
-      PYALL_LOG_DIR: /data/logs
+      QCALL_MCP_TRANSPORT: http
+      QCALL_MCP_HOST: 0.0.0.0
+      QCALL_MCP_PORT: "8000"
+      # os.pathsep (":" on Linux) separates multiple allowed roots. Both /data and
+      # /mnt/e are confined roots the file system tools may read/write within.
+      QCALL_MCP_ROOT: /data:/mnt/e
+      QCALL_LOG_DIR: /data/logs

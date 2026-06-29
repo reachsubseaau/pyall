@@ -1,11 +1,11 @@
 @echo off
 rem ==========================================================================
-rem  launch_mcp.bat - start the pyall MCP server over HTTP on this machine/VM
+rem  launch_mcp.bat - start the qc.all MCP server over HTTP on this machine/VM
 rem                   and the status/log monitor web page (opened in a browser)
 rem
 rem  Edit the settings below, then double-click this file (or run it from a
 rem  command prompt).  Any arguments you pass to this script are forwarded to
-rem  pyall_mcp.py, so you can override the defaults, e.g.:
+rem  qcall_mcp.py, so you can override the defaults, e.g.:
 rem
 rem      launch_mcp.bat --port 9000
 rem      launch_mcp.bat --transport stdio
@@ -33,7 +33,7 @@ rem --------------------------------------------------------------------------
 set "PYTHON=%ROOT%.venv\Scripts\python.exe"
 
 rem  shared rotating log folder used by both the MCP server and the monitor
-set "PYALL_LOG_DIR=%LOGDIR%"
+set "QCALL_LOG_DIR=%LOGDIR%"
 
 rem  URL the monitor page is reached on (loopback even when bound to all NICs).
 set "MONHOST=%HOST%"
@@ -48,22 +48,22 @@ if not exist "%PYTHON%" (
     exit /b 1
 )
 
-echo Starting pyall monitor on %MONURL%
+echo Starting qc.all monitor on %MONURL%
 rem  start the monitor in its own window so it runs alongside the MCP server
-start "pyall monitor" "%PYTHON%" "%ROOT%monitor.py" --host %HOST% --port %MONPORT% --dir "%LOGDIR%"
+start "qc.all monitor" "%PYTHON%" "%ROOT%monitor.py" --host %HOST% --port %MONPORT% --dir "%LOGDIR%"
 
 rem  give the monitor a moment to bind, then open the page in the default browser
 timeout /t 1 /nobreak >nul
 start "" "%MONURL%"
 
-echo Starting pyall MCP server (HTTP) on %HOST%:%PORT%
+echo Starting qc.all MCP server (HTTP) on %HOST%:%PORT%
 echo File access confined to: %DATA%
 echo Endpoint: http://%HOST%:%PORT%/mcp
 echo Monitor:  %MONURL%
-echo Log file: %LOGDIR%\pyall.log
+echo Log file: %LOGDIR%\qcall.log
 echo Press Ctrl+C to stop.
 echo.
 
-"%PYTHON%" "%ROOT%pyall_mcp.py" --http --host %HOST% --port %PORT% --root "%DATA%" %*
+"%PYTHON%" "%ROOT%qcall_mcp.py" --http --host %HOST% --port %PORT% --root "%DATA%" %*
 
 endlocal

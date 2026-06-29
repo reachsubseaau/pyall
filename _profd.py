@@ -1,13 +1,13 @@
 import io
-import pyall
+import qcall
 
 nbeams = 6
-d = object.__new__(pyall.D_depth)
+d = object.__new__(qcall.D_depth)
 d.stx = 2
 d.typeofdatagram = 'D'
 d.emmodel = 300            # < 700 -> '=H3h2H2BbB'
 d.recorddate = 20140104
-d.time = pyall.to_timestamp(pyall.to_datetime(20140104, 3600.0))
+d.time = qcall.to_timestamp(qcall.to_datetime(20140104, 3600.0))
 d.counter = 7
 d.serialnumber = 999
 d.heading = 123.45
@@ -32,7 +32,7 @@ d.beamnumber = [0, 1, 2, 3, 4, 5]
 
 encoded = d.encode()
 buf = io.BytesIO(encoded)
-d2 = pyall.D_depth(buf, len(encoded))
+d2 = qcall.D_depth(buf, len(encoded))
 d2.read()
 
 def close(a, b, tol=1e-6):

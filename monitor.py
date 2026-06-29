@@ -1,20 +1,20 @@
 # name:         monitor
 # created:      June 2026
 # by:           paul.kennedy@guardiangeomatics.com
-# description:  tiny web server that shows the live status and log of pyall while it processes
+# description:  tiny web server that shows the live status and log of qc.all while it processes
 #               .all files.  The page auto-refreshes every few seconds so you can watch progress.
 #
-# Run it in a second terminal while pyall.py / the MCP server is processing:
+# Run it in a second terminal while qcall.py / the MCP server is processing:
 #
 #       .venv\Scripts\python.exe monitor.py
 #       .venv\Scripts\python.exe monitor.py --dir <folder> --port 8770
 #
 # Then open http://127.0.0.1:8770/ in a browser.
 #
-# It reads two things written by pyall:
-#   * pyall.log          - the shared rotating run log (one file for the whole server)
-#   * pyall_status.json  - the current job/file/progress (written by pyall.writestatus)
-# By default it watches the shared log folder (the PYALL_LOG_DIR environment variable, or a
+# It reads two things written by qc.all:
+#   * qcall.log          - the shared rotating run log (one file for the whole server)
+#   * qcall_status.json  - the current job/file/progress (written by qcall.writestatus)
+# By default it watches the shared log folder (the QCALL_LOG_DIR environment variable, or a
 # "logs" folder next to this script) so it shows everything the MCP server processes.
 # Use --dir to watch a specific job's output folder instead.
 
@@ -30,18 +30,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_NAME = "reachlogo.png"
 LOGO_PATH = os.path.join(SCRIPT_DIR, LOGO_NAME)
-LOG_NAME = "pyall.log"
-STATUS_NAME = "pyall_status.json"
+LOG_NAME = "qcall.log"
+STATUS_NAME = "qcall_status.json"
 README_NAME = "README.MD"
 LOG_TAIL_LINES = 500
 
 
 ###############################################################################
-def pyall_version():
-    '''return the pyall MCP server version by reading __version__ from pyall_mcp.py.
+def qcall_version():
+    '''return the qc.all MCP server version by reading __version__ from qcall_mcp.py.
     Reads the source file directly (no import) so the monitor has no heavy dependencies.'''
     try:
-        path = os.path.join(SCRIPT_DIR, "pyall_mcp.py")
+        path = os.path.join(SCRIPT_DIR, "qcall_mcp.py")
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip().startswith("__version__"):
@@ -54,8 +54,8 @@ def pyall_version():
 
 ###############################################################################
 def central_log_dir():
-    '''return the shared log folder used by pyall (must match pyall.logdirectory()).'''
-    d = os.environ.get("PYALL_LOG_DIR", "")
+    '''return the shared log folder used by qc.all (must match qcall.logdirectory()).'''
+    d = os.environ.get("QCALL_LOG_DIR", "")
     if not d:
         d = os.path.join(SCRIPT_DIR, "logs")
     return d
@@ -66,7 +66,7 @@ def find_watch_dir(start):
     '''return the most sensible folder to watch.
 
     Prefer the shared central log folder, then the newest folder that already contains a
-    pyall log/status file, then the start folder itself.
+    qc.all log/status file, then the start folder itself.
     '''
     central = central_log_dir()
     if os.path.isfile(os.path.join(central, LOG_NAME)) or os.path.isfile(os.path.join(central, STATUS_NAME)):
@@ -207,7 +207,7 @@ def render_page(watchdir, interval, base=""):
         )
 
     statustable = "<table class='status'>%s</table>" % "".join(rows) if rows else \
-        "<p class='dim'>No status reported yet. pyall writes <code>pyall_status.json</code> " \
+        "<p class='dim'>No status reported yet. qc.all writes <code>qcall_status.json</code> " \
         "into this folder once it starts processing a file &mdash; it will appear here automatically.</p>"
 
     logblock = html.escape(logtext) if logtext else "(no log output yet)"
@@ -218,7 +218,7 @@ def render_page(watchdir, interval, base=""):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="{interval}">
-<title>pyall monitor - {state}</title>
+<title>qc.all monitor - {state}</title>
 <style>
   :root {{ color-scheme: dark; }}
   * {{ box-sizing: border-box; }}
@@ -258,7 +258,7 @@ def render_page(watchdir, interval, base=""):
 <body>
 <header>
   <img class="logo" src="{logoname}" alt="REACH" onerror="this.style.display='none'">
-  <h1>pyall monitor</h1>
+  <h1>qc.all monitor</h1>
   <span class="badge">{state}</span>
   <span class="path">v{version}</span>
   <span class="path">{watchdir}</span>
@@ -286,7 +286,7 @@ def render_page(watchdir, interval, base=""):
         interval=interval,
         state=html.escape(state),
         badge=badge_colour,
-        version=html.escape(pyall_version()),
+        version=html.escape(qcall_version()),
         watchdir=html.escape(watchdir),
         statustable=statustable,
         progressbar=progressbar,
@@ -432,7 +432,7 @@ def render_about_page(base=""):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pyall monitor - about &amp; help</title>
+<title>qc.all monitor - about &amp; help</title>
 <style>
   :root {{ color-scheme: dark; }}
   * {{ box-sizing: border-box; }}
@@ -465,7 +465,7 @@ def render_about_page(base=""):
 <body>
 <header>
   <img class="logo" src="{logoname}" alt="REACH" onerror="this.style.display='none'">
-  <h1>pyall monitor &mdash; about &amp; help</h1>
+  <h1>qc.all monitor &mdash; about &amp; help</h1>
   <a class="back" href="{homeurl}">&larr; back to monitor</a>
 </header>
 <main>
@@ -473,13 +473,13 @@ def render_about_page(base=""):
     {body}
   </div>
 </main>
-<footer>pyall v{version}</footer>
+<footer>qc.all v{version}</footer>
 </body>
 </html>""".format(
         logoname=html.escape(logourl),
         homeurl=html.escape(homeurl),
         body=body,
-        version=html.escape(pyall_version()),
+        version=html.escape(qcall_version()),
     )
 
 
@@ -527,10 +527,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
 ###############################################################################
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Serve a web page showing the live status and log of pyall processing.")
+        description="Serve a web page showing the live status and log of qc.all processing.")
     parser.add_argument("--dir", default="",
-                        help="Folder to watch (the one containing pyall.log / pyall_status.json). "
-                             "Default: the shared log folder (PYALL_LOG_DIR or a 'logs' folder next to this script).")
+                        help="Folder to watch (the one containing qcall.log / qcall_status.json). "
+                             "Default: the shared log folder (QCALL_LOG_DIR or a 'logs' folder next to this script).")
     parser.add_argument("--host", default="127.0.0.1",
                         help="Interface to bind (default 127.0.0.1; use 0.0.0.0 for other machines).")
     parser.add_argument("--port", type=int, default=8770, help="TCP port (default 8770).")
@@ -545,7 +545,7 @@ def main(argv=None):
 
     server = ThreadingHTTPServer((args.host, args.port), MonitorHandler)
     url = "http://%s:%d/" % ("127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host, args.port)
-    print("pyall monitor serving %s" % url)
+    print("qc.all monitor serving %s" % url)
     print("Watching folder: %s" % watchdir)
     print("Auto-refresh every %ds.  Press Ctrl+C to stop." % MonitorHandler.interval)
     try:

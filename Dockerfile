@@ -1,16 +1,16 @@
 # syntax=docker/dockerfile:1
 #
-# pyall MCP server - container image
+# qc.all MCP server - container image
 #
-# Serves the pyall Model Context Protocol server over HTTP (streamable-http) so a
+# Serves the qc.all Model Context Protocol server over HTTP (streamable-http) so a
 # remote MCP client can reach it across the network.  File access is confined to
 # /data, which you mount from the host.
 #
 # Build:
-#     docker build -t pyall-mcp .
+#     docker build -t qcall-mcp .
 #
 # Run (mount your survey data read-only and publish the port):
-#     docker run --rm -p 8000:8000 -v C:\surveydata:/data:ro pyall-mcp
+#     docker run --rm -p 8000:8000 -v C:\surveydata:/data:ro qcall-mcp
 #
 # The MCP endpoint is then http://<host>:8000/mcp
 
@@ -43,34 +43,34 @@ RUN python -m pip install --upgrade pip \
 COPY . .
 
 # Default runtime configuration.  Every value can be overridden at `docker run`
-# time with -e, and these map onto pyall_mcp.py's command line options.
-#   PYALL_MCP_TRANSPORT  http  -> serve over HTTP (streamable-http)
-#   PYALL_MCP_HOST       0.0.0.0 -> listen on all interfaces inside the container
-#   PYALL_MCP_PORT       8000
-#   PYALL_MCP_ROOT       /data -> file access is confined to this folder
-#   PYALL_LOG_DIR        /data/logs -> shared rotating log (visible to the monitor)
-ENV PYALL_MCP_TRANSPORT=http \
-    PYALL_MCP_HOST=0.0.0.0 \
-    PYALL_MCP_PORT=8000 \
-    PYALL_MCP_ROOT=/data \
-    PYALL_LOG_DIR=/data/logs
+# time with -e, and these map onto qcall_mcp.py's command line options.
+#   QCALL_MCP_TRANSPORT  http  -> serve over HTTP (streamable-http)
+#   QCALL_MCP_HOST       0.0.0.0 -> listen on all interfaces inside the container
+#   QCALL_MCP_PORT       8000
+#   QCALL_MCP_ROOT       /data -> file access is confined to this folder
+#   QCALL_LOG_DIR        /data/logs -> shared rotating log (visible to the monitor)
+ENV QCALL_MCP_TRANSPORT=http \
+    QCALL_MCP_HOST=0.0.0.0 \
+    QCALL_MCP_PORT=8000 \
+    QCALL_MCP_ROOT=/data \
+    QCALL_LOG_DIR=/data/logs
 
 # The folder survey data is mounted into and outputs/logs are written to.
 RUN mkdir -p /data
 VOLUME ["/data"]
 
 # Run as an unprivileged user.
-RUN useradd --create-home --uid 10001 pyall \
- && chown -R pyall:pyall /app /data
-USER pyall
+RUN useradd --create-home --uid 10001 qcall \
+ && chown -R qcall:qcall /app /data
+USER qcall
 
 EXPOSE 8000
 
 # Simple TCP health check - the container is healthy once the HTTP server accepts
 # connections on the configured port.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import os,socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1', int(os.environ.get('PYALL_MCP_PORT','8000')))))"
+    CMD python -c "import os,socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1', int(os.environ.get('QCALL_MCP_PORT','8000')))))"
 
-# pyall_mcp.py reads the PYALL_MCP_* environment variables above, so no arguments
-# are needed.  Extra flags can still be appended, e.g. `docker run ... pyall-mcp --port 9000`.
-ENTRYPOINT ["python", "pyall_mcp.py"]
+# qcall_mcp.py reads the QCALL_MCP_* environment variables above, so no arguments
+# are needed.  Extra flags can still be appended, e.g. `docker run ... qcall-mcp --port 9000`.
+ENTRYPOINT ["python", "qcall_mcp.py"]

@@ -1,6 +1,6 @@
-# pyall
+# qc.all
 
-`pyall` is a Python toolkit for reading **Kongsberg `.all` multibeam echosounder files**. It can:
+`qc.all` is a Python toolkit for reading **Kongsberg `.all` multibeam echosounder files**. It can:
 
 - decode every common datagram (position, attitude, depth, runtime, sound velocity, seabed image, ...);
 - build georeferenced **bathymetric point clouds** (east, north, depth, quality, reflectivity);
@@ -19,7 +19,7 @@
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Example output](#example-output)
-- [Using the `pyall` module](#using-the-pyall-module)
+- [Using the `qc.all` module](#using-the-qc.all-module)
   - [Low-level datagram reader](#low-level-datagram-reader)
   - [Point clouds and GeoTIFFs](#point-clouds-and-geotiffs)
   - [Loader helpers](#loader-helpers)
@@ -55,20 +55,20 @@ A sample data file is included at `sample/0253_20140104_000401_Duke.all`.
 
 ```powershell
 # summarise a file (datagram counts, position, suitable EPSG)
-.\.venv\Scripts\python.exe pyall.py -i sample\0253_20140104_000401_Duke.all -info
+.\.venv\Scripts\python.exe qcall.py -i sample\0253_20140104_000401_Duke.all -info
 
 # create a point cloud CSV + GeoTIFF for every .all file in a folder
-.\.venv\Scripts\python.exe pyall.py -i sample
+.\.venv\Scripts\python.exe qcall.py -i sample
 ```
 
 ```python
 # or from python
-import pyall
+import qcall
 
-info = pyall.getfileinfo(r"sample\0253_20140104_000401_Duke.all")
+info = qcall.getfileinfo(r"sample\0253_20140104_000401_Duke.all")
 print(info["epsg"], info["datagramcounts"])
 
-tif = pyall.depthtotif(r"sample\0253_20140104_000401_Duke.all", value="depth", colour="jeca")
+tif = qcall.depthtotif(r"sample\0253_20140104_000401_Duke.all", value="depth", colour="jeca")
 print("wrote", tif)
 ```
 
@@ -84,10 +84,10 @@ stripe or dark swath edges):
 
 ```powershell
 # bathymetry  -> public/sample_bathymetry.tif
-.\.venv\Scripts\python.exe pyall.py -i sample\sample.all -grid -value depth -colour jeca -resolution 1
+.\.venv\Scripts\python.exe qcall.py -i sample\sample.all -grid -value depth -colour jeca -resolution 1
 
 # backscatter (AVG-corrected) -> public/sample_backscatter.tif
-.\.venv\Scripts\python.exe pyall.py -i sample\sample.all -grid -value reflectivity -colour grey -resolution 1
+.\.venv\Scripts\python.exe qcall.py -i sample\sample.all -grid -value reflectivity -colour grey -resolution 1
 ```
 
 **Bathymetry (depth, `jeca` colour ramp)**
@@ -103,7 +103,103 @@ directly in QGIS, ArcGIS or any GIS package.
 
 ---
 
-## Using the `pyall` module
+## Backscatter Angular Varied Gain (AVG)
+
+Raw seabed backscatter has a strong dependence on beam angle - the seabed reflects much
+more energy near nadir than at grazing angles - so a raw mosaic shows a bright nadir stripe
+and dark swath edges. `backscattertotif()` removes this by characterising the angular
+response (mean backscatter vs beam angle from nadir) and subtracting that trend from every
+sounding before gridding.
+
+### Persistent, accumulating AVG curve
+
+A single survey line rarely contains enough soundings to resolve the sharp nadir response,
+so a per-file AVG leaves a residual nadir spike. To fix this the AVG curve is **persisted to
+disc and accumulated across every file processed**. Each store keeps a per-angle-bin running
+sum and count of backscatter on a fixed -90&deg;..+90&deg; grid (default bin size 0.5&deg;),
+so each new file simply adds to it and the running-mean curve steadily improves - resolving
+and removing the nadir spike as more files are processed.
+
+### How the store is keyed (serial number + depth mode)
+
+The angular response is a property of the **sonar** and the **acoustic mode** it was running in. Each
+AVG curve is therefore keyed by:
+
+- **Transducer serial number** - taken from the **first Installation (`I`) datagram's
+  `serialnumber` field** (the primary sonar head / system serial). This is *not* a port/stbd
+  designation: the `.all` install record carries `serialnumber` (head 1) and
+  `Secondaryserialnumber` (head 2, non-zero only on dual-head systems such as a twin-head
+  EM2040/EM3002). The store currently keys on the primary serial only.
+- **Depth mode** - taken from the **runtime (`R`) datagram's `depthmode`** (e.g. `Shallow`,
+  `Medium`, `VeryDeep`, or `300kHz`/`400kHz` on EM2040), since the angular response differs
+  between modes.
+
+Stores live in an `avgcache/` folder beside the module (override with `avgdir`), one JSON file per
+(serial, depth mode, bin size):
+
+```text
+avgcache/avg_<serialnumber>_<depthmode>_<binsize>deg.json   e.g. avg_105_Shallow_0.5deg.json
+```
+
+### Per-line correction, store-assisted
+
+Although the store accumulates across all files, the **nadir specular strength also varies line to
+line** (with absolute depth and seabed type) even within one depth mode, so a *pooled* average curve
+under-corrects any line whose nadir is brighter than average - leaving a bright nadir stripe. Each
+line is therefore flattened against **its own per-angle response** wherever it has enough soundings in
+a bin (true for every near-nadir bin on a normal line); the accumulated store is used only to fill
+sparse bins on short lines. On the test data this took the residual mosaic nadir excess from **3.7 dB
+(pooled) down to ~0.1 dB (per-line)**.
+
+### Options
+
+```python
+import qcall
+
+f = r"sample\0106_20131224_160458_Duke.all"
+
+# AVG-corrected mosaic (default) - accumulates into the persistent store
+avg = qcall.backscattertotif(f, resolution=2, colour='grey')
+
+# reference mosaic BEFORE AVG - grids raw backscatter, does NOT touch the store
+raw = qcall.backscattertotif(f, resolution=2, colour='grey', applyavg=False)
+```
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `applyavg` | `True` | `False` grids raw (uncorrected) backscatter - a reference mosaic. Output is named `_backscatter_raw_...` vs `_backscatter_avg_...`. |
+| `useavgstore` | `True` | `False` uses a per-file AVG only (no disc store). |
+| `anglebinsize` | `0.5` | Width in degrees of the AVG angle bins. |
+| `avgdir` | `''` | Folder for the persistent store. Empty uses `avgcache/` beside the module. |
+| `gridstat` | `'mean'` | Per-cell reducer: `'mean'` (smooth tones - reflectivity is 0.5 dB quantised, so `'median'` posterizes the contrast), `'median'` or `'trimmed'` (10% trimmed mean). |
+| `despikepings` | `0` | Optional light along-track running-median window (pings). Off by default - it smooths along-track and lowers apparent resolution. |
+| `nadirmaskdeg` | `2.5` | Drop soundings within this many degrees of nadir (the unreliable specular zone) to remove the bright nadir line. `0` keeps the nadir. |
+| `nadirfill` | `True` | Interpolate backscatter across the thin nadir gap left by `nadirmaskdeg` (confined to interior cells, so swath edges are never extrapolated). |
+| `nadirdespikepings` | `0` | Optional longer along-track median window on near-nadir beams. Not recommended (reinforces the nadir stripe); prefer `nadirmaskdeg`. |
+| `greystretch` | `'minmax'` | Greyscale tone mapping: `'minmax'` (full-range linear - smooth, low-contrast, keeps dark detail), `'percentile'` (clip tails) or `'stddev'` (mean ± `greysigma`·σ). |
+| `greysigma` | `2.5` | Standard deviations each side of the mean for `'stddev'`. |
+| `greygamma` | `1.0` | Gamma on the 0-1 tones. `<1` lifts shadows, `>1` darkens. |
+| `infill` | `True` | Interpolate across empty cells inside the swath (the stipple a finer grid leaves between soundings), leaving the swath edges / outside-swath nodata untouched. |
+| `minspeedmps` | `0` | Drop pings slower than this (m/s) - trims line-start/turn slow-downs. Off by default. |
+| `maxturnratedegs` | `0` | Drop pings whose heading turn-rate exceeds this (deg/s) - trims line turns. Off by default. |
+
+### The nadir line and how it is removed
+
+After the per-line AVG flattens the *mean* angular response, a sharp **bright hairline can remain
+along the nadir**. Investigation showed this is **not** random speckle and **not** a geometric error
+(the per-ping nadir peak angle does not correlate with vessel roll, r &asymp; -0.10, or seabed slope,
+r &asymp; -0.20): it is **consistent specular energy** in the innermost beams. A mean AVG cannot
+remove it, and along-track smoothing only reinforces it into a continuous bright stripe.
+
+The robust solution - as used by production backscatter mosaickers - is to **drop the nadir beams**
+(`nadirmaskdeg`, default 2.5&deg;) and **interpolate across the thin gap** (`nadirfill`, default on). On
+a single line this yields a smooth, gap-free mosaic with the bright line gone; across an overlapping
+survey the neighbouring lines' outer beams cover the nadir completely. A light `despikepings` median
+and robust `median` cell gridding clean up the remaining speckle.
+
+---
+
+## Using the `qc.all` module
 
 ### Low-level datagram reader
 
@@ -112,9 +208,9 @@ type code and a class instance; you then call `.read()` on the records you care
 about, which keeps scanning fast.
 
 ```python
-import pyall
+import qcall
 
-r = pyall.allreader(r"sample\0253_20140104_000401_Duke.all")
+r = qcall.allreader(r"sample\0253_20140104_000401_Duke.all")
 
 while r.moredata():
     typeofdatagram, datagram = r.readdatagram()
@@ -139,21 +235,21 @@ Common datagram codes: `P` position, `A`/`n` attitude, `C` clock, `D`/`X` depth,
 ### Point clouds and GeoTIFFs
 
 ```python
-import pyall
+import qcall
 
 filename = r"sample\0253_20140104_000401_Duke.all"
 params = {'epsg': '0', 'odir': 'out', 'debug': '-1', 'verbose': False}
 
 # build a point cloud (east, north, depth, quality, reflectivity)
-cloud = pyall.loaddata(filename, params)
+cloud = qcall.loaddata(filename, params)
 print(len(cloud.xarr), "points")
 print(cloud.xarr[0], cloud.yarr[0], cloud.zarr[0], cloud.qarr[0], cloud.rarr[0])
 
 # write a CSV (_R.txt) + float GeoTIFF in one step
-geotiff = pyall.all2point(filename, params)
+geotiff = qcall.all2point(filename, params)
 
 # or grid directly with colour / reflectivity options
-shaded = pyall.depthtotif(filename, resolution=2, value='reflectivity', colour='grey')
+shaded = qcall.depthtotif(filename, resolution=2, value='reflectivity', colour='grey')
 ```
 
 `epsg='0'` auto-detects a suitable projected CRS from the file's first position.
@@ -185,10 +281,10 @@ These functions read a whole file and return ready-to-use Python/NumPy data:
 
 ## Command line tools
 
-`pyall.py` reads a file (or folder) and writes a point cloud CSV plus a GeoTIFF.
+`qcall.py` reads a file (or folder) and writes a point cloud CSV plus a GeoTIFF.
 
 ```powershell
-.\.venv\Scripts\python.exe pyall.py -i <file-or-folder> [options]
+.\.venv\Scripts\python.exe qcall.py -i <file-or-folder> [options]
 ```
 
 | Option | Default | Description |
@@ -206,11 +302,11 @@ If no `-i` is given it processes every `.all` file in the current directory.
 
 ## The MCP server
 
-`pyall_mcp.py` is a [Model Context Protocol](https://modelcontextprotocol.io) server
-built with `FastMCP`. It exposes the pyall functionality as tools that an AI
+`qcall_mcp.py` is a [Model Context Protocol](https://modelcontextprotocol.io) server
+built with `FastMCP`. It exposes the qc.all functionality as tools that an AI
 assistant (Claude Desktop, VS Code, etc.) can call. It runs blocking work on a
 dedicated worker thread pool so several requests execute in parallel, and depends
-only on the `pyall` module.
+only on the `qc.all` module.
 
 Over HTTP the server runs **stateful** sessions: every connecting client is issued
 its own `Mcp-Session-Id`, and concurrent requests from different sessions are
@@ -224,7 +320,7 @@ For a local client on the same machine, run it over the **stdio** transport
 (the default). The client normally launches it for you:
 
 ```powershell
-.\.venv\Scripts\python.exe pyall_mcp.py
+.\.venv\Scripts\python.exe qcall_mcp.py
 ```
 
 To run it on a **VM / shared server** so other machines on the office network can
@@ -232,7 +328,7 @@ reach it, run it over **HTTP** (the *streamable-http* transport) and confine fil
 access to your survey data folder(s):
 
 ```powershell
-.\.venv\Scripts\python.exe pyall_mcp.py --http --host 0.0.0.0 --port 8000 --root D:\surveydata
+.\.venv\Scripts\python.exe qcall_mcp.py --http --host 0.0.0.0 --port 8000 --root D:\surveydata
 ```
 
 | Option | Default | Description |
@@ -243,8 +339,8 @@ access to your survey data folder(s):
 | `--port` | `8000` | TCP port to listen on (HTTP/SSE only). |
 | `--root` | none | Folder that **all** file paths and file-system tools are confined to. Repeat for several folders. |
 
-Each option also has an environment variable equivalent: `PYALL_MCP_TRANSPORT`,
-`PYALL_MCP_HOST`, `PYALL_MCP_PORT` and `PYALL_MCP_ROOT` (the latter is
+Each option also has an environment variable equivalent: `QCALL_MCP_TRANSPORT`,
+`QCALL_MCP_HOST`, `QCALL_MCP_PORT` and `QCALL_MCP_ROOT` (the latter is
 `os.pathsep`-separated for multiple roots).
 
 When the HTTP server is running, its MCP endpoint is
@@ -267,17 +363,17 @@ HTTP server can run as a container (e.g. on an office VM). The image serves the
 **Build the image:**
 
 ```powershell
-docker build -t pyall-mcp .
+docker build -t qcall-mcp .
 ```
 
 **Run it**, mounting your survey-data folder at `/data` and publishing the port:
 
 ```powershell
 # read-only data mount (recommended if the server only needs to read .all files)
-docker run --rm -p 8000:8000 -v C:\surveydata:/data:ro pyall-mcp
+docker run --rm -p 8000:8000 -v C:\surveydata:/data:ro qcall-mcp
 
 # read-write (needed if you want GeoTIFF/CSV outputs written back to the host)
-docker run --rm -p 8000:8000 -v C:\surveydata:/data pyall-mcp
+docker run --rm -p 8000:8000 -v C:\surveydata:/data qcall-mcp
 ```
 
 **Or with Docker Compose** (edit the `volumes:` line to point at your data):
@@ -304,11 +400,11 @@ through the same environment variables as the script — override any of them wi
 
 | Variable | Default in image | Purpose |
 | --- | --- | --- |
-| `PYALL_MCP_TRANSPORT` | `http` | Transport (`http`, `sse` or `stdio`). |
-| `PYALL_MCP_HOST` | `0.0.0.0` | Bind address inside the container. |
-| `PYALL_MCP_PORT` | `8000` | Port (also `EXPOSE`d and published). |
-| `PYALL_MCP_ROOT` | `/data` | Folder file access is confined to. |
-| `PYALL_LOG_DIR` | `/data/logs` | Shared rotating log location. |
+| `QCALL_MCP_TRANSPORT` | `http` | Transport (`http`, `sse` or `stdio`). |
+| `QCALL_MCP_HOST` | `0.0.0.0` | Bind address inside the container. |
+| `QCALL_MCP_PORT` | `8000` | Port (also `EXPOSE`d and published). |
+| `QCALL_MCP_ROOT` | `/data` | Folder file access is confined to. |
+| `QCALL_LOG_DIR` | `/data/logs` | Shared rotating log location. |
 
 The container runs as a non-root user and includes a TCP health check, so
 `docker ps` reports it as *healthy* once the server is accepting connections.
@@ -325,9 +421,9 @@ The container runs as a non-root user and includes a TCP health check, so
 ```json
 {
   "mcpServers": {
-    "pyall": {
-      "command": "C:\\ggtools\\pyall\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\ggtools\\pyall\\pyall_mcp.py"]
+    "qcall": {
+      "command": "C:\\ggtools\\qcall\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\ggtools\\qcall\\qcall_mcp.py"]
     }
   }
 }
@@ -339,7 +435,7 @@ launching a command:
 ```json
 {
   "mcpServers": {
-    "pyall": {
+    "qcall": {
       "url": "http://my-office-vm:8000/mcp"
     }
   }
@@ -350,16 +446,16 @@ launching a command:
 launches each `mcpServers` entry as a local command (stdio). To also reach an
 HTTP server, add a second entry that bridges to the URL with
 [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) (requires Node.js, which
-provides `npx`). Start the HTTP server first (`pyall_mcp.py --http ...`):
+provides `npx`). Start the HTTP server first (`qcall_mcp.py --http ...`):
 
 ```json
 {
   "mcpServers": {
-    "pyall": {
-      "command": "C:\\ggtools\\pyall\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\ggtools\\pyall\\pyall_mcp.py"]
+    "qcall": {
+      "command": "C:\\ggtools\\qcall\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\ggtools\\qcall\\qcall_mcp.py"]
     },
-    "pyall-http": {
+    "qcall-http": {
       "command": "npx",
       "args": ["-y", "mcp-remote", "http://my-office-vm:8000/mcp"]
     }
@@ -367,7 +463,7 @@ provides `npx`). Start the HTTP server first (`pyall_mcp.py --http ...`):
 }
 ```
 
-The `pyall` entry runs locally over stdio; the `pyall-http` entry connects to the
+The `qc.all` entry runs locally over stdio; the `qcall-http` entry connects to the
 already-running HTTP server. Restart Claude Desktop after editing the file.
 
 **VS Code (`.vscode/mcp.json`).** VS Code uses a slightly different schema and can
@@ -377,12 +473,12 @@ is included in this repo at [`.vscode/mcp.json`](.vscode/mcp.json):
 ```json
 {
   "servers": {
-    "pyall": {
+    "qcall": {
       "type": "stdio",
       "command": "${workspaceFolder}/.venv/Scripts/python.exe",
-      "args": ["${workspaceFolder}/pyall_mcp.py"]
+      "args": ["${workspaceFolder}/qcall_mcp.py"]
     },
-    "pyall-http": {
+    "qcall-http": {
       "type": "http",
       "url": "http://localhost:8000/mcp"
     }
@@ -390,8 +486,8 @@ is included in this repo at [`.vscode/mcp.json`](.vscode/mcp.json):
 }
 ```
 
-Start the HTTP server yourself (`pyall_mcp.py --http ...`) before starting the
-`pyall-http` entry; the `pyall` (stdio) entry is launched by VS Code for you.
+Start the HTTP server yourself (`qcall_mcp.py --http ...`) before starting the
+`qcall-http` entry; the `qc.all` (stdio) entry is launched by VS Code for you.
 
 ### Available tools
 
@@ -432,7 +528,7 @@ Long-running tools return a `job_id` immediately instead of blocking the request
 until its `status` is `complete` (or `error`); the `result` then carries the exact
 output path (`geotiff` / `pointcloud_csv`) ready for `download_file`. `list_jobs`
 shows what is running or recently finished. Live progress is also visible on the
-`/monitor` page and in `pyall_status.json` (see `get_server_info` → `status_file`).
+`/monitor` page and in `qcall_status.json` (see `get_server_info` → `status_file`).
 
 **Datagram record access**
 
@@ -561,7 +657,7 @@ calls `get_clock` and `get_runtime_parameters` and returns the decoded records
 You can quickly verify the tools are registered without a client:
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import asyncio, pyall_mcp; print(sorted(t.name for t in asyncio.run(pyall_mcp.mcp.list_tools())))"
+.\.venv\Scripts\python.exe -c "import asyncio, qcall_mcp; print(sorted(t.name for t in asyncio.run(qcall_mcp.mcp.list_tools())))"
 ```
 
 ---
@@ -570,10 +666,10 @@ You can quickly verify the tools are registered without a client:
 
 - `<file>_R.txt` — CSV point cloud: `east, north, depth, quality, reflectivity`.
 - `<file>_..._depth.tif` / reflectivity tif — GeoTIFF raster (float, colour ramp or greyscale).
-- `logs/pyall.log` — a single **shared, rotating** run log used by both the CLI and the
+- `logs/qcall.log` — a single **shared, rotating** run log used by both the CLI and the
   MCP server (rotates at 5 MB, 5 backups). Override the location with the
-  `PYALL_LOG_DIR` environment variable.
-- `pyall_status.json` — current job/progress, written to `logs/` (and a copy into each
+  `QCALL_LOG_DIR` environment variable.
+- `qcall_status.json` — current job/progress, written to `logs/` (and a copy into each
   output folder) for the monitor.
 
 ---
@@ -593,7 +689,7 @@ a different machine):
 # then open http://127.0.0.1:8770/
 ```
 
-By default it watches the shared log folder (`PYALL_LOG_DIR`, or a `logs/` folder next
+By default it watches the shared log folder (`QCALL_LOG_DIR`, or a `logs/` folder next
 to the scripts), so it shows everything the MCP server processes — point it elsewhere
 with `--dir`. `launch_mcp.bat` starts this monitor automatically and opens it in your
 browser.

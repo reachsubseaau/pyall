@@ -1,4 +1,4 @@
-# name:              pyALL
+# name:              qc.all
 # created:        May 2018
 # by:            paul.kennedy@guardiangeomatics.com
 # description:   python module to read a Kongsberg ALL sonar file
@@ -15,6 +15,7 @@ import os.path
 import time
 import io
 import json
+import re
 import argparse
 from datetime import datetime
 from datetime import timedelta
@@ -27,6 +28,10 @@ import threading
 import timeseries
 import ggmbes
 import fileutils
+
+# single source of truth for the package version (qcall_mcp re-exports this).  Bump on every change.
+# It is also tagged into backscatter mosaic filenames so different algorithm versions are identifiable.
+__version__ = "1.6.15"
 
 ###############################################################################
 # per-thread progress hook
@@ -300,16 +305,16 @@ def    log(msg, error = False, printmsg=True):
 ###############################################################################
 # centralised rotating log + live status (shared by the CLI and the MCP server)
 ###############################################################################
-LOGFILENAME = 'pyall.log'
-STATUSFILENAME = 'pyall_status.json'
+LOGFILENAME = 'qcall.log'
+STATUSFILENAME = 'qcall_status.json'
 _statusfile_lastwrite = 0.0
 
 ###############################################################################
 def logdirectory():
     '''return the folder that holds the shared rotating log and the central status file.
-    Override with the PYALL_LOG_DIR environment variable; defaults to a "logs" folder
+    Override with the QCALL_LOG_DIR environment variable; defaults to a "logs" folder
     next to this module so the CLI, the MCP server and the monitor all agree on it.'''
-    d = os.environ.get('PYALL_LOG_DIR', '')
+    d = os.environ.get('QCALL_LOG_DIR', '')
     if not d:
         d = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
     return d
@@ -329,11 +334,11 @@ def setup_logging(logdir=None, level=logging.INFO, maxbytes=5 * 1024 * 1024, bac
     root.setLevel(level)
     # only add our rotating handler once, even if called many times
     for h in root.handlers:
-        if getattr(h, '_pyall_rotating', False):
+        if getattr(h, '_qcall_rotating', False):
             return logpath
     handler = logging.handlers.RotatingFileHandler(
         logpath, maxBytes=maxbytes, backupCount=backups, encoding='utf-8')
-    handler._pyall_rotating = True
+    handler._qcall_rotating = True
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     root.addHandler(handler)
     return logpath
@@ -558,6 +563,153 @@ def _gridtomean(east, north, value, resolution):
     countarr = np.flip(counts.reshape(sz).T, axis=0)
     return meanarr, countarr, mnoriginal, mxoriginal
 
+
+###############################################################################
+def _gridtostat(east, north, value, resolution, stat='mean', trim=0.1):
+    '''bin (east, north, value) points into a regular grid and reduce each cell with *stat*:
+
+      'mean'    - arithmetic mean (fast path, identical to _gridtomean).
+      'median'  - per-cell median; robust to the bright/dark specular outliers that streak the nadir.
+      'trimmed' - mean after dropping the top/bottom *trim* fraction of each cell's values.
+
+    The median/trimmed reducers knock down short-term specular speckle so a few flashes in a cell no
+    longer pull its value up.  returns (array, countarray, (xmin, ymin), (xmax, ymax)); rows run north
+    (top) to south (bottom).'''
+    xy = np.vstack([east, north])
+    mnoriginal = xy.min(axis=1)
+    mxoriginal = xy.max(axis=1)
+
+    xycm = xy * 100.0
+    xybin = ((xycm + (resolution * 100.0) / 2.0) // (resolution * 100.0)).astype(int)
+    mn = xybin.min(axis=1)
+    mx = xybin.max(axis=1)
+    sz = mx + 1 - mn
+    flatidx = np.ravel_multi_index(xybin - mn[:, None], dims=sz)
+    ncells = int(sz.prod())
+    counts = np.bincount(flatidx, None, ncells)
+
+    if stat == 'mean':
+        sums = np.bincount(flatidx, value, ncells)
+        out = sums / np.maximum(1, counts)
+    else:
+        # sort points by (cell, value) so each cell's values are contiguous and ascending
+        order = np.lexsort((value, flatidx))
+        sf = flatidx[order]
+        sv = value[order]
+        cells, starts, cnts = np.unique(sf, return_index=True, return_counts=True)
+        if stat == 'trimmed':
+            lo = starts + np.floor(cnts * float(trim)).astype(int)
+            hi = starts + np.ceil(cnts * (1.0 - float(trim))).astype(int)
+            hi = np.maximum(hi, lo + 1)                  # always keep at least one value
+            csum = np.concatenate(([0.0], np.cumsum(sv)))
+            vals = (csum[hi] - csum[lo]) / (hi - lo)
+        else:  # median (default for any non-mean/non-trimmed request)
+            midlo = starts + (cnts - 1) // 2
+            midhi = starts + cnts // 2
+            vals = 0.5 * (sv[midlo] + sv[midhi])
+        out = np.zeros(ncells)
+        out[cells] = vals
+
+    arr = np.flip(out.reshape(sz).T, axis=0)
+    countarr = np.flip(counts.reshape(sz).T, axis=0)
+    return arr, countarr, mnoriginal, mxoriginal
+
+
+###############################################################################
+def _infillinteriorholes(arr, mask, maxgapcells=1.5, maxsearchcells=2.0):
+    '''interpolate the small empty cells a finer grid leaves between soundings, without smearing the
+    swath edge.
+
+    Every nodata cell whose distance to the nearest real sounding cell is <= *maxgapcells* is filled
+    by a short-range interpolation (rasterio fillnodata, search radius *maxsearchcells*).  Because the
+    inter-sounding stipple gaps are ~1 cell wide they are all filled, while the open nodata beyond the
+    swath is many cells from data and is left alone - so the edge keeps its natural ragged outline and
+    is not stretched outward.  Needs scipy; if unavailable the array is returned unchanged.
+    returns (arr, mask).'''
+    if not mask.any() or not (~mask).any():
+        return arr, mask
+    try:
+        from scipy import ndimage
+    except Exception:
+        return arr, mask
+    import rasterio.fill
+    dist = ndimage.distance_transform_edt(mask)              # cells: distance to nearest data cell
+    region = mask & (dist <= float(maxgapcells))
+    if not region.any():
+        return arr, mask
+    filled = rasterio.fill.fillnodata(np.where(mask, 0.0, arr).astype('float32'),
+                                      mask=(~mask).astype('uint8'),
+                                      max_search_distance=float(maxsearchcells), smoothing_iterations=0)
+    newly = region & np.isfinite(filled) & (filled != 0.0)
+    if newly.any():
+        arr = np.where(newly, filled, arr)
+        mask = mask & ~newly
+    return arr, mask
+
+
+###############################################################################
+def _despikealongtrack(backscatter, pingid, beamid, window, angles=None, nadirwindow=0, nadirzonedeg=8.0):
+    '''suppress along-track speckle with a running-median FIFO, optionally stronger near nadir.
+
+    Builds a [ping x beam] grid of backscatter and replaces each value with the median of the same
+    beam over a sliding window of consecutive pings.  A median (not mean) window removes transient
+    specular flashes while preserving the seabed trend.
+
+    The near-nadir beams are far noisier than the outer swath: the specular response is a sharp,
+    slightly off-nadir peak, so tiny per-sounding beam-angle errors map to large backscatter errors
+    and streak the nadir.  When *angles* is given and *nadirwindow* > *window*, beams whose mean
+    |angle-from-nadir| is below *nadirzonedeg* use the longer *nadirwindow* (heavily smoothing the
+    unreliable, heavily-overlapped nadir strip) while the outer beams keep the short *window* (so
+    outer-swath resolution is preserved).  returns a despiked copy of *backscatter*.'''
+    window = int(window)
+    nadirwindow = int(nadirwindow)
+    if window < 3 and nadirwindow < 3:
+        return backscatter
+    npings = int(pingid.max()) + 1
+    nbeams = int(beamid.max()) + 1
+    grid = np.full((npings, nbeams), np.nan, dtype=float)
+    valid = np.isfinite(backscatter) & (backscatter != 0)
+    grid[pingid[valid], beamid[valid]] = backscatter[valid]
+
+    # choose a median window per beam column: longer for near-nadir beams when requested
+    colwindow = np.full(nbeams, max(window, 0), dtype=int)
+    if angles is not None and nadirwindow > window:
+        anggrid = np.full((npings, nbeams), np.nan, dtype=float)
+        anggrid[pingid[valid], beamid[valid]] = angles[valid]
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            meanabsang = np.nanmean(np.abs(anggrid), axis=0)
+        nadircols = np.isfinite(meanabsang) & (meanabsang < float(nadirzonedeg))
+        colwindow[nadircols] = nadirwindow
+
+    from numpy.lib.stride_tricks import sliding_window_view
+    out = grid.copy()
+    import warnings
+    with np.errstate(all='ignore'):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN windows -> NaN, handled below
+            # filter each group of columns that share a window in one vectorised pass
+            for win in np.unique(colwindow):
+                if win < 3:
+                    continue
+                w = win if win % 2 else win + 1            # force odd, centred
+                cols = np.where(colwindow == win)[0]
+                half = w // 2
+                sub = grid[:, cols]
+                padded = np.pad(sub, ((half, half), (0, 0)), constant_values=np.nan)
+                chunk = max(500, 4_000_000 // max(1, len(cols) * w))   # bound peak memory
+                for s in range(0, npings, chunk):
+                    e = min(npings, s + chunk)
+                    sw = sliding_window_view(padded[s:e + 2 * half], w, axis=0)  # (e-s, len(cols), w)
+                    out[s:e, cols] = np.nanmedian(sw, axis=2)
+
+    despiked = backscatter.copy()
+    med = out[pingid, beamid]
+    use = np.isfinite(med)
+    despiked[use] = med[use]
+    return despiked
+
 ###############################################################################
 def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0', outfilename='', fill=False, maxpings=-1, verbose=False, odir='', colourmin=None, colourmax=None, keeprejected=False, shade=True, shadeazimuth=325.0, shadealtitude=15.0, vertical='waterline'):
     '''grid the bathymetry from a .all file into a GeoTIFF.
@@ -636,6 +788,9 @@ def depthtotif(filename, resolution=0.0, value='depth', colour='none', epsg='0',
             os.makedirs(targetdir, exist_ok=True)
         outfilename = os.path.join(targetdir, os.path.basename(filename) + suffix)
 
+    # hillshade is only meaningful for a depth surface - never shade reflectivity/backscatter
+    shade = shade and value == 'depth'
+
     return _savegridtotif(outfilename, arr, mask, geo, transform, resolution,
                           colour=colour, colourmin=colourmin, colourmax=colourmax, fill=fill,
                           shade=shade, shadeazimuth=shadeazimuth, shadealtitude=shadealtitude)
@@ -659,7 +814,7 @@ def _hillshade(array, azimuth=325.0, altitude=15.0, cellsize=1.0):
 
 
 ###############################################################################
-def _savegridtotif(outfilename, arr, mask, geo, transform, resolution, colour='none', colourmin=None, colourmax=None, fill=False, shade=False, shadeazimuth=325.0, shadealtitude=15.0):
+def _savegridtotif(outfilename, arr, mask, geo, transform, resolution, colour='none', colourmin=None, colourmax=None, fill=False, shade=False, shadeazimuth=325.0, shadealtitude=15.0, stretch='percentile', stretchsigma=2.5, clippercent=2.5, gamma=1.0):
     '''write a gridded 2d array to a GeoTIFF.  colour='none' -> single band float; 'jeca' -> RGB colour
     ramp; 'grey' -> RGB greyscale.  Masked (empty) cells are nodata/black.  Shared by the bathymetry and
     backscatter gridders.  When *shade* is set, a hillshade (default sun azimuth 325 deg, altitude 15 deg)
@@ -682,12 +837,35 @@ def _savegridtotif(outfilename, arr, mask, geo, transform, resolution, colour='n
     else:
         # 3 band RGB (coloured ramp or greyscale)
         valid = arr[~mask]
-        vmin = float(colourmin) if colourmin is not None else (float(valid.min()) if valid.size else 0.0)
-        vmax = float(colourmax) if colourmax is not None else (float(valid.max()) if valid.size else 1.0)
+        # work out the palette range.  Explicit colourmin/colourmax always win; otherwise *stretch*
+        # selects the mechanism: 'stddev' (mean +/- stretchsigma*std - a gentle, low-contrast stretch
+        # for backscatter), 'percentile' (clip the clippercent tails) or 'minmax'.
+        if colourmin is not None:
+            vmin = float(colourmin)
+        elif not valid.size:
+            vmin = 0.0
+        elif stretch == 'stddev':
+            vmin = float(valid.mean() - float(stretchsigma) * valid.std())
+        elif stretch == 'minmax':
+            vmin = float(valid.min())
+        else:
+            vmin = float(np.percentile(valid, float(clippercent)))
+        if colourmax is not None:
+            vmax = float(colourmax)
+        elif not valid.size:
+            vmax = 1.0
+        elif stretch == 'stddev':
+            vmax = float(valid.mean() + float(stretchsigma) * valid.std())
+        elif stretch == 'minmax':
+            vmax = float(valid.max())
+        else:
+            vmax = float(np.percentile(valid, 100.0 - float(clippercent)))
         if vmax <= vmin:
             vmax = vmin + 1.0
-        log("Colour palette range: %.3f to %.3f" % (vmin, vmax))
+        log("Colour palette range: %.3f to %.3f (%s)" % (vmin, vmax, stretch))
         norm = np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0)
+        if gamma and float(gamma) != 1.0:
+            norm = norm ** float(gamma)
         idx = (norm * 255.0).astype(int)
         idx = np.clip(idx, 0, 255)
 
@@ -730,13 +908,163 @@ def _savegridtotif(outfilename, arr, mask, geo, transform, resolution, colour='n
 
 
 ###############################################################################
-def computeangularvariedgain(angles, backscatter, binsize=1.0):
+# persistent Angular Varied Gain (AVG) store
+#
+# The seabed angular backscatter response is a property of the sonar (transducer serial number) and
+# the acoustic mode it was running in (depth mode), not of any single survey line.  A single .all
+# file rarely contains enough soundings to characterise the sharp nadir response, so the per-file
+# AVG leaves a bright nadir spike behind.  To fix this we accumulate the angular response (per-bin
+# sum and count of backscatter) on disc keyed by (serialnumber, depthmode) and grow it with every
+# file processed.  The running mean of the accumulated store is a steadily improving AVG curve that
+# resolves the nadir spike and removes it from the mosaic.
+###############################################################################
+_AVG_ANGLE_MIN = -90.0          # canonical angle-from-nadir grid so every file bins identically
+_AVG_ANGLE_MAX = 90.0
+_avgstorelocks = {}             # one lock per store file for safe read-modify-write under threading
+_avgstorelocksguard = threading.Lock()
+
+
+def _defaultavgdir():
+    '''default folder for the persistent AVG store (next to this module).'''
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'avgcache')
+
+
+def _avgsanitise(text):
+    '''make a serial number / depth mode string safe to embed in a filename.'''
+    s = re.sub(r'[^A-Za-z0-9._-]+', '_', str(text)).strip('_')
+    return s or 'unknown'
+
+
+def _avgstorelock(storefile):
+    '''return (creating if needed) the lock guarding a particular AVG store file.'''
+    with _avgstorelocksguard:
+        lk = _avgstorelocks.get(storefile)
+        if lk is None:
+            lk = threading.Lock()
+            _avgstorelocks[storefile] = lk
+        return lk
+
+
+def _avgcanonicaledges(binsize):
+    '''fixed angle-from-nadir bin edges shared by every file so stores are mergeable.'''
+    binsize = float(binsize) if binsize and binsize > 0 else 1.0
+    edges = np.arange(_AVG_ANGLE_MIN, _AVG_ANGLE_MAX + binsize, binsize)
+    return edges, binsize
+
+
+def avgstorepath(avgdir, serialnumber, depthmode, binsize=0.5):
+    '''build the on-disc path for the AVG store of one (serialnumber, depthmode) at a given bin size.'''
+    avgdir = avgdir or _defaultavgdir()
+    name = "avg_%s_%s_%gdeg.json" % (_avgsanitise(serialnumber), _avgsanitise(depthmode), float(binsize))
+    return os.path.join(avgdir, name)
+
+
+def _loadavgstore(storefile, nbins, binsize):
+    '''read the accumulated per-bin (sums, counts) from disc; zeros if missing or incompatible.'''
+    if storefile and os.path.isfile(storefile):
+        try:
+            with open(storefile, 'r') as f:
+                d = json.load(f)
+            if int(d.get('nbins', -1)) == nbins and float(d.get('binsize', 0)) == float(binsize):
+                return (np.asarray(d['sums'], dtype=float), np.asarray(d['counts'], dtype=float))
+        except Exception:
+            pass
+    return np.zeros(nbins, dtype=float), np.zeros(nbins, dtype=float)
+
+
+def _saveavgstore(storefile, sums, counts, binsize, serialnumber, depthmode):
+    '''atomically write the accumulated per-bin (sums, counts) back to disc.'''
+    if not storefile:
+        return
+    os.makedirs(os.path.dirname(storefile), exist_ok=True)
+    payload = {
+        'serialnumber': str(serialnumber), 'depthmode': str(depthmode),
+        'binsize': float(binsize), 'nbins': int(len(sums)),
+        'anglemin': _AVG_ANGLE_MIN, 'anglemax': _AVG_ANGLE_MAX,
+        'totalsamples': int(counts.sum()),
+        'sums': [float(x) for x in sums], 'counts': [float(x) for x in counts],
+        'updated': time.time(),
+    }
+    tmp = storefile + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(payload, f)
+    os.replace(tmp, storefile)
+
+
+def _trendfromstore(sums, counts, centres):
+    '''running-mean AVG trend from accumulated (sums, counts); empty bins interpolated.'''
+    nbins = len(counts)
+    trend = np.full(nbins, np.nan)
+    nonempty = counts > 0
+    trend[nonempty] = sums[nonempty] / counts[nonempty]
+    if nonempty.sum() >= 2:
+        trend = np.interp(centres, centres[nonempty], trend[nonempty])
+    elif nonempty.sum() == 1:
+        trend[:] = float(trend[nonempty][0])
+    else:
+        trend[:] = 0.0
+    return trend
+
+
+def accumulateangularvariedgain(angles, backscatter, storefile, binsize=0.5,
+                                serialnumber='', depthmode='', minfilesamples=50):
+    '''accumulate this file's angular response into the persistent store and return an AVG trend that
+    flattens THIS line's own across-swath response, falling back to the accumulated store only where
+    the file is too thin to characterise a bin.
+
+    The nadir specular strength varies line-to-line (depth / seabed type) even within one depth mode,
+    so a pooled multi-file mean under-corrects any line whose nadir is brighter than average and leaves
+    a bright nadir stripe.  Each line is therefore flattened against its OWN per-angle mean wherever it
+    has at least *minfilesamples* soundings in a bin (true for every near-nadir bin on a normal line),
+    and the running store mean is used only to fill sparse bins on short files.  The store is still
+    grown with every file (so it steadily improves and remains available for thin lines).
+
+    returns (centres, trend, edges, totalsamples).'''
+    edges, binsize = _avgcanonicaledges(binsize)
+    nbins = len(edges) - 1
+    centres = edges[:-1] + binsize / 2.0
+
+    # bin this file's soundings on the canonical grid
+    idx = np.clip(np.digitize(angles, edges) - 1, 0, nbins - 1)
+    filesums = np.bincount(idx, backscatter, nbins)
+    filecounts = np.bincount(idx, None, nbins)
+
+    if storefile:
+        with _avgstorelock(storefile):
+            storesums, storecounts = _loadavgstore(storefile, nbins, binsize)
+            storesums = storesums + filesums
+            storecounts = storecounts + filecounts
+            _saveavgstore(storefile, storesums, storecounts, binsize, serialnumber, depthmode)
+    else:
+        storesums, storecounts = filesums, filecounts
+
+    # prefer this file's own per-angle mean (smooth despite the 0.5 dB reflectivity quantisation and
+    # adapts to this line); fall back to the accumulated store mean only for bins it barely samples
+    trend = np.full(nbins, np.nan)
+    usefile = filecounts >= int(minfilesamples)
+    trend[usefile] = filesums[usefile] / filecounts[usefile]
+    usestore = (~usefile) & (storecounts > 0)
+    trend[usestore] = storesums[usestore] / storecounts[usestore]
+    known = np.isfinite(trend)
+    if known.sum() >= 2:
+        trend = np.interp(centres, centres[known], trend[known])
+    elif known.sum() == 1:
+        trend[:] = float(trend[known][0])
+    else:
+        trend[:] = 0.0
+    return centres, trend, edges, int(storecounts.sum())
+
+
+###############################################################################
+def computeangularvariedgain(angles, backscatter, binsize=0.5):
     '''build the Angular Varied Gain (AVG) trend for a swath of backscatter.
 
     The seabed reflects more energy near nadir than at the outer beams, so raw backscatter has a
     strong dependence on beam angle.  This bins every sounding by its beam angle from nadir (port
     negative, starboard positive) and returns the mean backscatter per angle bin - the angular
-    response curve that the mosaic must be flattened against.
+    response curve that the mosaic must be flattened against.  The mean (not median) is used because
+    the recorded reflectivity is quantised to 0.5 dB steps, and a per-bin median snaps to those steps
+    and bands the mosaic, whereas the mean averages the quantisation out into a smooth curve.
 
     returns (bincentres, trend, edges); trend[i] is the mean backscatter in angle bin i (empty bins
     are linearly interpolated from their neighbours).'''
@@ -769,8 +1097,11 @@ def _loadbackscatterpoints(filename, runtime_params):
     '''load per-beam seabed backscatter with map position and beam angle from nadir.
 
     returns numpy arrays: east, north, backscatter (dB), angle (deg, port -ve / stbd +ve) and a
-    rejected boolean mask.  The beam angle is derived from the across-track offset and the sounding
-    depth (atan2(acrosstrack, depth)), which is the incidence angle on a locally flat seabed.'''
+    rejected boolean mask, followed by the transducer serial number (I datagram) and depth mode
+    (R datagram) used to key the persistent AVG store, and finally per-sounding ping index and beam
+    index (used by the along-track despike FIFO).  The beam angle is derived from the across-track
+    offset and the sounding depth (atan2(acrosstrack, depth)), which is the incidence angle on a
+    locally flat seabed.'''
     start_time = time.time()
     maxpings = int(_get_runtime_param(runtime_params, 'debug', -1))
     if maxpings == -1:
@@ -797,10 +1128,20 @@ def _loadbackscatterpoints(filename, runtime_params):
                 recordcount=int(recordcount), epsg=str(epsg), elapsed=0.0)
 
     easts, norths, bs, angles, rejected = [], [], [], [], []
+    pingids, beamids = [], []   # per-sounding ping index and beam index for the along-track despike FIFO
+    pingts, pinge, pingn, pinghdg = [], [], [], []   # per-ping time/position/heading for speed & turn-rate
+    serialnumber = None        # transducer serial (I datagram) - keys the persistent AVG store
+    depthmode = None           # acoustic depth mode (R datagram) - keys the persistent AVG store
     pingcounter = 0
     while r.moredata():
         typeofdatagram, datagram = r.readdatagram()
-        if typeofdatagram in ('X', 'D'):
+        if typeofdatagram == 'I' and serialnumber is None:
+            datagram.read()
+            serialnumber = datagram.serialnumber
+        elif typeofdatagram == 'R' and depthmode is None:
+            datagram.read()
+            depthmode = datagram.depthmode
+        elif typeofdatagram in ('X', 'D'):
             datagram.read()
             ts = to_timestamp(to_datetime(datagram.recorddate, datagram.time))
             lat = tslatitude.getValueAt(ts)
@@ -809,6 +1150,7 @@ def _loadbackscatterpoints(filename, runtime_params):
             detinfo = getattr(datagram, 'detectioninformation', None)
             rtclean = getattr(datagram, 'realtimecleaninginformation', None)
             heading = datagram.heading
+            pingts.append(ts); pinge.append(e0); pingn.append(n0); pinghdg.append(heading)
             for idx in range(datagram.nbeams):
                 depth = datagram.depth[idx]
                 across = datagram.acrosstrackdistance[idx]
@@ -818,6 +1160,8 @@ def _loadbackscatterpoints(filename, runtime_params):
                 norths.append(n)
                 bs.append(datagram.reflectivity[idx])
                 angles.append(math.degrees(math.atan2(across, abs(depth))) if depth else 0.0)
+                pingids.append(pingcounter)
+                beamids.append(idx)
                 rej = int(detinfo[idx]) if detinfo is not None else 0
                 if rtclean is not None and rtclean[idx] < 0:
                     rej |= 0x80
@@ -836,31 +1180,110 @@ def _loadbackscatterpoints(filename, runtime_params):
     writestatus(statusodir, state='loaded', job='Backscatter AVG mosaic',
                 file=os.path.basename(filename), progress=1.0, pings=pingcounter,
                 recordcount=int(recordcount), epsg=str(epsg), elapsed=time.time() - start_time)
+
+    # per-ping vessel speed (m/s) and heading turn-rate (deg/s) from the ping positions/headings,
+    # used to trim line turns and slow-downs where the backscatter geometry is unreliable
+    pt = np.array(pingts, dtype=float)
+    pe = np.array(pinge, dtype=float)
+    pn = np.array(pingn, dtype=float)
+    ph = np.array(pinghdg, dtype=float)
+    npings = pt.size
+    pingspeed = np.zeros(npings, dtype=float)
+    pingturn = np.zeros(npings, dtype=float)
+    if npings >= 2:
+        dt = np.diff(pt)
+        dt[dt <= 0] = np.nan
+        sp = np.hypot(np.diff(pe), np.diff(pn)) / dt
+        dh = (np.diff(ph) + 180.0) % 360.0 - 180.0          # wrap heading change to +/-180
+        tr = np.abs(dh) / dt
+        pingspeed[1:] = sp
+        pingspeed[0] = sp[0] if sp.size else 0.0
+        pingturn[1:] = tr
+        pingturn[0] = tr[0] if tr.size else 0.0
+        # smooth over a few pings so a single noisy nav/heading sample does not trim a whole ping
+        if npings >= 5:
+            from numpy.lib.stride_tricks import sliding_window_view
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                pad = lambda a: np.pad(a, 2, mode='edge')
+                pingspeed = np.nanmedian(sliding_window_view(pad(pingspeed), 5), axis=1)
+                pingturn = np.nanmedian(sliding_window_view(pad(pingturn), 5), axis=1)
+    pingspeed = np.nan_to_num(pingspeed, nan=0.0)
+    pingturn = np.nan_to_num(pingturn, nan=0.0)
+
     return (np.array(easts, dtype=float), np.array(norths, dtype=float),
             np.array(bs, dtype=float), np.array(angles, dtype=float),
-            np.array(rejected, dtype=bool))
+            np.array(rejected, dtype=bool), serialnumber, depthmode,
+            np.array(pingids, dtype=np.int64), np.array(beamids, dtype=np.int64),
+            pingspeed, pingturn)
 
 
 ###############################################################################
-def backscattertotif(filename, resolution=0.0, epsg='0', outfilename='', maxpings=-1, verbose=False, odir='', colour='grey', colourmin=None, colourmax=None, anglebinsize=1.0, keeprejected=False):
+def backscattertotif(filename, resolution=0.0, epsg='0', outfilename='', maxpings=-1, verbose=False, odir='', colour='grey', colourmin=None, colourmax=None, anglebinsize=0.5, keeprejected=False, avgdir='', useavgstore=True, applyavg=True, gridstat='mean', despikepings=0, nadirdespikepings=0, nadirzonedeg=8.0, nadirmaskdeg=2.5, nadirfill=True, minspeedmps=0.0, maxturnratedegs=0.0, greystretch='minmax', greysigma=2.5, greygamma=1.0, infill=True):
     '''grid seabed backscatter (reflectivity) into a GeoTIFF with an Angular Varied Gain (AVG) correction.
 
     Backscatter is NOT gridded the same way as bathymetry.  A raw mosaic shows a bright nadir stripe and
     dark swath edges because the seabed returns more energy near nadir than at grazing angles.  This
-    method first characterises that angular response by accumulating the AVG trend (mean backscatter vs
-    beam angle from nadir, over every ping), then subtracts the trend from each sounding - normalising
-    every beam angle back to the survey mean - before gridding.  The result is a radiometrically balanced
-    backscatter mosaic with the across-track angular seam removed.
+    method characterises that angular response (mean backscatter vs beam angle from nadir), then
+    subtracts the trend from each sounding - normalising every beam angle back to the survey mean -
+    before gridding.  The result is a radiometrically balanced mosaic with the across-track angular
+    seam removed.
+
+    The angular response is a property of the sonar and its acoustic mode, but its nadir strength also
+    varies line-to-line with depth and seabed type, so each line is flattened against its OWN per-angle
+    response (which removes that line's nadir spike).  When *useavgstore* is True the response is also
+    accumulated to disc keyed by the transducer serial number (installation 'I' datagram) and depth
+    mode (runtime 'R' datagram); that growing store is used only to fill angle bins a short line cannot
+    populate on its own.
+
+    The residual nadir imbalance is NOT random speckle that smoothing can fix - it is consistent
+    specular energy in the innermost beams.  The specular peak is sharp and slightly off-nadir, the
+    recorded near-nadir reflectivity is unreliable, and a mean AVG cannot remove it (along-track
+    smoothing only reinforces it into a bright stripe).  The robust solution is to drop the nadir
+    beams entirely (*nadirmaskdeg*) - exactly as production backscatter mosaickers do - and interpolate
+    across the resulting thin gap (*nadirfill*); overlapping survey lines then fill it completely in a
+    combined mosaic.
 
     resolution    : grid cell size in metres.  0 (default) auto-computes a coarse value from beam spacing.
     colour        : 'grey' (default) greyscale, 'jeca' colour ramp, or 'none' for a single band float tif.
-    anglebinsize  : width in degrees of the AVG angle bins. [Default: 1.0]
+    anglebinsize  : width in degrees of the AVG angle bins. [Default: 0.5]
     keeprejected  : keep soundings flagged as rejected. [Default: drop them]
+    avgdir        : folder for the persistent AVG store.  Empty uses an 'avgcache' folder beside this module.
+    useavgstore   : when True (default) accumulate and reuse the AVG curve on disc keyed by
+                    (serialnumber, depthmode).  False reverts to a per-file AVG only.
+    applyavg      : when True (default) apply the AVG correction.  False grids the raw (uncorrected)
+                    backscatter - a useful reference mosaic showing the nadir stripe before AVG.
+    gridstat      : per-cell reducer - 'mean' (default, smooth tones; reflectivity is 0.5 dB quantised so
+                    'median' posterises the contrast), 'median' or 'trimmed' (10%% trimmed mean).
+    despikepings  : optional light along-track running-median spike filter (pings) applied to all beams.
+                    [Default: 0, off]  Smooths along-track and lowers apparent resolution, so off by default.
+    nadirmaskdeg  : drop soundings within this many degrees of nadir (the unreliable specular zone) so
+                    the bright nadir line is removed. [Default: 2.5]  0 keeps the nadir.
+    nadirfill     : when True (default) interpolate backscatter across the thin nadir gap left by
+                    *nadirmaskdeg* so a single line has no gap.  Ignored when *nadirmaskdeg* is 0.
+    infill        : when True (default) interpolate across empty cells fully enclosed by data (the
+                    scattered single-cell gaps left by the finer auto grid), leaving swath edges alone.
+    nadirdespikepings : optional longer along-track median window on the near-nadir beams (within
+                    *nadirzonedeg*). [Default: 0, off]  Not recommended - it reinforces the nadir stripe;
+                    prefer *nadirmaskdeg*.
+    nadirzonedeg  : half-width (deg from nadir) of the beams treated as nadir for *nadirdespikepings*. [Default: 8]
+    minspeedmps   : drop pings where the vessel was slower than this (m/s) - trims line-start/turn
+                    slow-downs where swaths pile up. [Default: 0, off]
+    maxturnratedegs : drop pings where the heading turn-rate exceeds this (deg/s) - trims line turns.
+                    [Default: 0, off]
+    greystretch   : greyscale tone mapping - 'minmax' (default, full-range linear: smooth, low-contrast,
+                    keeps dark-area detail), 'percentile' (clip the tails) or 'stddev' (mean +/- greysigma*std).
+                    colourmin/colourmax override it.
+    greysigma     : standard deviations each side of the mean for the 'stddev' stretch. [Default: 2.5]
+    greygamma     : gamma applied to the 0..1 tones.  <1 lifts the shadows, >1 darkens. [Default: 1.0, linear]
     returns the path to the created GeoTIFF, or None if no data could be extracted.'''
     from rasterio.transform import from_origin
 
     if resolution is None or float(resolution) <= 0:
-        resolution = computeapproximateresolution(filename)
+        # backscatter carries fine texture worth keeping, so grid close to the raw beam spacing
+        # (coarsen 1.0) rather than the coarser default used for bathymetry
+        resolution = computeapproximateresolution(filename, coarsen=1.0)
         log("Auto-computed grid resolution: %.3f m" % (resolution))
     resolution = float(resolution)
 
@@ -871,44 +1294,116 @@ def backscattertotif(filename, resolution=0.0, epsg='0', outfilename='', maxping
 
     runtime_params = {'epsg': epsg, 'debug': str(maxpings), 'verbose': bool(verbose), 'spherical': False, 'odir': odir}
     log("Loading seabed backscatter for AVG correction...")
-    east, north, backscatter, angles, rejected = _loadbackscatterpoints(filename, runtime_params)
+    east, north, backscatter, angles, rejected, serialnumber, depthmode, pingids, beamids, pingspeed, pingturn = _loadbackscatterpoints(filename, runtime_params)
     if east.size == 0:
         log("No backscatter extracted from %s" % (filename), error=True)
         return None
+
+    # ---- along-track running-median FIFO: knock down per-ping speckle (stronger near nadir) ----
+    if (despikepings and int(despikepings) >= 3) or (nadirdespikepings and int(nadirdespikepings) >= 3):
+        backscatter = _despikealongtrack(backscatter, pingids, beamids, despikepings,
+                                         angles=angles, nadirwindow=int(nadirdespikepings),
+                                         nadirzonedeg=nadirzonedeg)
+        if int(nadirdespikepings) > int(despikepings):
+            log("Applied angle-adaptive despike (outer %d pings, nadir %d pings within %.1f deg)" % (
+                int(despikepings), int(nadirdespikepings), float(nadirzonedeg)))
+        else:
+            log("Applied along-track running-median despike over %d pings" % (int(despikepings)))
 
     # keep finite, non-zero soundings; drop rejected unless asked to keep them
     keep = np.isfinite(backscatter) & np.isfinite(angles) & (backscatter != 0)
     if not keeprejected:
         keep &= ~rejected
+    # trim line turns / slow-downs where the swath geometry is unreliable (opt-in)
+    if (minspeedmps and minspeedmps > 0) or (maxturnratedegs and maxturnratedegs > 0):
+        badping = np.zeros(pingspeed.size, dtype=bool)
+        if minspeedmps and minspeedmps > 0:
+            badping |= pingspeed < float(minspeedmps)
+        if maxturnratedegs and maxturnratedegs > 0:
+            badping |= pingturn > float(maxturnratedegs)
+        if badping.any():
+            trimmed = int(badping[pingids].sum())
+            keep &= ~badping[pingids]
+            log("Trimmed %d soundings from %d slow/turning pings" % (trimmed, int(badping.sum())))
+    # coordinates of every accepted sounding (including nadir) - used to confine the nadir gap-fill
+    # to genuine interior holes so the swath edges are never extrapolated outward
+    covereast, covernorth = east[keep], north[keep]
+    domask = bool(nadirmaskdeg and float(nadirmaskdeg) > 0)
+    if domask:
+        masked = int((np.abs(angles[keep]) < float(nadirmaskdeg)).sum())
+        keep &= np.abs(angles) >= float(nadirmaskdeg)
+        log("Masked %d soundings within %.1f deg of nadir" % (masked, float(nadirmaskdeg)))
     east, north, backscatter, angles = east[keep], north[keep], backscatter[keep], angles[keep]
     if east.size == 0:
         log("No accepted backscatter samples to grid for %s" % (filename), error=True)
         return None
 
     # ---- Angular Varied Gain: characterise then flatten the across-swath angular response ----
-    centres, trend, edges = computeangularvariedgain(angles, backscatter, anglebinsize)
-    globalmean = float(np.mean(backscatter))
-    nbins = len(edges) - 1
-    binidx = np.clip(np.digitize(angles, edges) - 1, 0, nbins - 1)
-    corrected = backscatter - trend[binidx] + globalmean
-    log("Applied AVG correction over %d angle bins of %.1f deg (survey mean %.2f dB)" % (nbins, float(anglebinsize), globalmean))
+    if not applyavg:
+        # reference mosaic: grid the raw backscatter with no AVG correction (still shows the nadir stripe)
+        corrected = backscatter
+        log("AVG correction disabled - gridding raw backscatter (%d samples)" % (backscatter.size))
+    else:
+        if useavgstore:
+            storefile = avgstorepath(avgdir, serialnumber, depthmode, anglebinsize)
+            centres, trend, edges, totalsamples = accumulateangularvariedgain(
+                angles, backscatter, storefile, anglebinsize, serialnumber, depthmode)
+            log("AVG store %s (serial %s, mode %s) now holds %d samples" % (
+                os.path.basename(storefile), serialnumber, depthmode, totalsamples))
+        else:
+            centres, trend, edges = computeangularvariedgain(angles, backscatter, anglebinsize)
+        globallevel = float(np.mean(backscatter))   # add back the regional level so values keep their dB scale
+        nbins = len(edges) - 1
+        binidx = np.clip(np.digitize(angles, edges) - 1, 0, nbins - 1)
+        corrected = backscatter - trend[binidx] + globallevel
+        log("Applied AVG correction over %d angle bins of %.1f deg (survey mean %.2f dB)" % (nbins, float(anglebinsize), globallevel))
 
-    arr, countarr, (xmin, ymin), (xmax, ymax) = _gridtomean(east, north, corrected, resolution)
+    arr, countarr, (xmin, ymin), (xmax, ymax) = _gridtostat(east, north, corrected, resolution, stat=gridstat)
     mask = countarr == 0
+    log("Gridded backscatter with per-cell '%s' statistic" % (gridstat))
+
+    # interpolate across the thin nadir gap left by nadirmaskdeg so a single line has no gap.
+    # the fill is confined to interior cells that HAD coverage before the nadir mask, so the swath
+    # edges (genuine nodata) are never extrapolated outward.
+    if domask and nadirfill and mask.any():
+        _, covcount, _, _ = _gridtostat(covereast, covernorth, np.zeros(covereast.size), resolution, stat='mean')
+        if covcount.shape == countarr.shape:
+            fillregion = mask & (covcount > 0)
+            if fillregion.any():
+                import rasterio.fill
+                filled = rasterio.fill.fillnodata(np.where(mask, 0.0, arr).astype('float32'),
+                                                  mask=(~mask).astype('uint8'),
+                                                  max_search_distance=20.0, smoothing_iterations=0)
+                newly = fillregion & np.isfinite(filled) & (filled != 0.0)
+                if newly.any():
+                    arr = np.where(newly, filled, arr)
+                    mask = mask & ~newly
+                    log("Filled %d interior nadir-gap cells by interpolation" % (int(newly.sum())))
+
+    # close the scattered single-cell gaps left by the finer auto grid (interior holes only)
+    if infill and mask.any():
+        before = int(mask.sum())
+        arr, mask = _infillinteriorholes(arr, mask)
+        closed = before - int(mask.sum())
+        if closed > 0:
+            log("Infilled %d interior empty cells" % (closed))
 
     height, width = arr.shape
     transform = from_origin(xmin - resolution / 2.0, ymax + resolution / 2.0, resolution, resolution)
 
     if len(outfilename) == 0:
         rendering = colour if colour != 'none' else 'float'
-        suffix = "_backscatter_avg_%s_%gm.tif" % (rendering, resolution)
+        kind = "avg" if applyavg else "raw"
+        # tag the algorithm version into the name so different versions are easy to compare
+        suffix = "_backscatter_%s_%s_%gm_v%s.tif" % (kind, rendering, resolution, __version__)
         targetdir = odir if len(odir) > 0 else os.path.dirname(filename)
         if len(targetdir) > 0 and not os.path.isdir(targetdir):
             os.makedirs(targetdir, exist_ok=True)
         outfilename = os.path.join(targetdir, os.path.basename(filename) + suffix)
 
     out = _savegridtotif(outfilename, arr, mask, geo, transform, resolution,
-                         colour=colour, colourmin=colourmin, colourmax=colourmax)
+                         colour=colour, colourmin=colourmin, colourmax=colourmax,
+                         stretch=greystretch, stretchsigma=greysigma, gamma=greygamma)
     writestatus(odir or os.path.dirname(filename), state='done', job='Backscatter AVG mosaic',
                 file=os.path.basename(filename), progress=1.0, epsg=str(epsg), geotiff=out)
     return out

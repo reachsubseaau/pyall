@@ -16,7 +16,7 @@
 # Local logs, status and generated outputs
 logs/
 *.log
-pyall_status.json
+qcall_status.json
 sample/all2point_*/
 sample/test_colour/
 *_R.txt

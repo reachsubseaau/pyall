@@ -1,17 +1,17 @@
-# name:         pyall_mcp
+# name:         qcall_mcp
 # created:      June 2026
 # by:           paul.kennedy@guardiangeomatics.com
-# description:  Model Context Protocol (MCP) server exposing pyall point cloud generation tools.
+# description:  Model Context Protocol (MCP) server exposing qc.all point cloud generation tools.
 #
-# This server intentionally depends only on the consolidated `pyall` module for point cloud
+# This server intentionally depends only on the consolidated `qc.all` module for point cloud
 # generation.  Concurrency is handled here with a dedicated thread pool (see _to_thread) rather than
 # multiprocessing.
 #
 # Run with (local stdio transport, suitable for Claude Desktop / VS Code MCP clients):
-#       python pyall_mcp.py
+#       python qcall_mcp.py
 #
 # Run over HTTP so a remote client (e.g. across the office network to a VM) can reach it:
-#       python pyall_mcp.py --http --host 0.0.0.0 --port 8000 --root D:\surveydata
+#       python qcall_mcp.py --http --host 0.0.0.0 --port 8000 --root D:\surveydata
 #
 # When serving over HTTP, always pass one or more --root folders.  Every file system tool and
 # every input/output path is confined to those roots so remote clients cannot read arbitrary
@@ -38,18 +38,23 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import HTMLResponse, PlainTextResponse, JSONResponse, Response, FileResponse
 
-import pyall
+import qcall
 import monitor
 
 # version / authorship reported in the startup log
-__version__ = "1.5.0"
+__version__ = qcall.__version__
 __author__ = "paul.kennedy@guardiangeomatics.com"
+
+# TEST FLAG: when True the server refuses to start over the stdio transport (it will
+# only run over HTTP).  Used to temporarily disable the local stdio MCP so a single
+# HTTP instance owns the data folder / job registry.  Set back to False to re-enable.
+DISABLE_STDIO = True
 
 # send all processing log output to the single shared rotating log file so the
 # monitor web page (and admins) have one place to watch the whole server.
-LOGPATH = pyall.setup_logging()
+LOGPATH = qcall.setup_logging()
 
-mcp = FastMCP("pyall")
+mcp = FastMCP("qcall")
 
 
 ###############################################################################
@@ -143,11 +148,11 @@ async def monitor_logo(request):
 # another.  The pool is sized generously relative to the CPU count.
 ###############################################################################
 _MAXWORKERS = max(8, (os.cpu_count() or 4) * 2)
-_EXECUTOR = ThreadPoolExecutor(max_workers=_MAXWORKERS, thread_name_prefix="pyall")
+_EXECUTOR = ThreadPoolExecutor(max_workers=_MAXWORKERS, thread_name_prefix="qcall")
 
 
 async def _to_thread(func, *args, **kwargs):
-    '''run a blocking pyall call on the shared worker pool so requests run in parallel.'''
+    '''run a blocking qc.all call on the shared worker pool so requests run in parallel.'''
     sid = _session_id()
     if sid:
         logging.debug("session %s -> %s on worker pool", sid, getattr(func, "__name__", func))
@@ -163,7 +168,7 @@ async def _to_thread(func, *args, **kwargs):
 # around 30 s).  Rather than run that work inline, the long tools submit it to the worker
 # pool, register it here and return a job_id immediately.  The client then polls
 # get_job_status(job_id) / list_jobs() until the job is "complete" (or "error") and reads
-# the output path(s) from the stored result.  The thread-local pyall progress hook updates
+# the output path(s) from the stored result.  The thread-local qc.all progress hook updates
 # each job's progress as it runs, so concurrent jobs never cross-talk.
 ###############################################################################
 _JOBS = {}            # job_id -> serialisable status record
@@ -222,7 +227,7 @@ def _submit_job(tool, params, func, *args, **kwargs):
 
     def runner():
         _job_set(jid, status='running', started=time.time(), message='processing')
-        pyall.setprogresshook(hook)
+        qcall.setprogresshook(hook)
         try:
             result = func(*args, **kwargs)
             _job_set(jid, status='complete', result=result, progress=1.0,
@@ -234,7 +239,7 @@ def _submit_job(tool, params, func, *args, **kwargs):
             logging.error("job %s (%s) failed: %s", jid, tool, ex)
             raise
         finally:
-            pyall.setprogresshook(None)
+            qcall.setprogresshook(None)
             with _JOBS_LOCK:
                 r = _JOBS.get(jid)
                 if r and r.get('started'):
@@ -292,6 +297,21 @@ def _session_id():
 # FastMCP captures the original handler during __init__ (_setup_handlers), so we must
 # re-register the wrapper with the low-level server for it to actually intercept calls.
 ###############################################################################
+def _flush_logging():
+    '''force every log handler to write buffered records to disk right now.  never raises.
+
+    Called immediately after the "request arrived" line so that proof the MCP received an
+    instruction is on disk before the (possibly long-running, hanging or crashing) task starts.'''
+    try:
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _install_request_logging():
     original_call_tool = mcp.call_tool
 
@@ -301,6 +321,7 @@ def _install_request_logging():
         who = (" [session %s]" % sid) if sid else ""
         argkeys = ", ".join(sorted(arguments)) if isinstance(arguments, dict) else ""
         logging.info("MCP request -> %s(%s)%s", name, argkeys, who)
+        _flush_logging()   # guarantee the "instruction received" line hits disk before the task runs
         start = time.time()
         try:
             result = await original_call_tool(name, arguments)
@@ -407,7 +428,7 @@ def _resolve_output_dir(input_file, output_dir):
 
 ###############################################################################
 def _runtime_params(epsg, output_dir, max_pings, verbose):
-    '''build the runtime_params dictionary understood by the pyall functions.'''
+    '''build the runtime_params dictionary understood by the qc.all functions.'''
     return {
         'epsg': str(epsg),
         'odir': output_dir,
@@ -438,7 +459,7 @@ async def get_file_info(input_file: str) -> dict:
         input_file: Absolute path to the .all file.
     """
     input_file = _safe_file(input_file)
-    return await _to_thread(pyall.getfileinfo, input_file)
+    return await _to_thread(qcall.getfileinfo, input_file)
 
 
 ###############################################################################
@@ -447,7 +468,7 @@ def _grid_to_raster_run(input_file, resolution, value, colour, epsg, output_dir,
     '''blocking worker behind get_depth_raster / get_backscatter_raster (runs inside a job).
 
     Bins every sounding into a regular grid (per-cell mean) and writes a GeoTIFF.'''
-    tif = pyall.depthtotif(input_file, resolution, value, colour, epsg, "", False,
+    tif = qcall.depthtotif(input_file, resolution, value, colour, epsg, "", False,
                            max_pings, False, output_dir, colour_min, colour_max, keep_rejected)
     return {
         'input_file': input_file,
@@ -536,12 +557,12 @@ async def get_backscatter_raster(input_file: str, resolution: float = 0, colour:
 ###############################################################################
 def _make_pointcloud_csv(input_file, params):
     '''load a .all file into a point cloud and write it to a CSV.  returns (csv_path, point_count).'''
-    pointcloud = pyall.loaddata(input_file, params)
+    pointcloud = qcall.loaddata(input_file, params)
     count = len(pointcloud.xarr)
     csv = os.path.join(params['odir'], os.path.basename(input_file) + "_R.txt")
     if count == 0:
         return None, 0
-    pyall._savexyzcsv(csv, pointcloud.xarr, pointcloud.yarr, pointcloud.zarr,
+    qcall._savexyzcsv(csv, pointcloud.xarr, pointcloud.yarr, pointcloud.zarr,
                       pointcloud.qarr, pointcloud.rarr)
     return csv, count
 
@@ -550,7 +571,7 @@ def _make_pointcloud_csv(input_file, params):
 def _pointcloud_run(input_file, params):
     '''blocking worker behind get_pointcloud (runs inside a job).'''
     if str(params['epsg']) == '0':
-        params['epsg'] = str(pyall.getsuitableepsg(input_file))
+        params['epsg'] = str(qcall.getsuitableepsg(input_file))
     csv, count = _make_pointcloud_csv(input_file, params)
     return {
         'input_file': input_file,
@@ -597,7 +618,7 @@ def _batch_run(matches, operation, odir, epsg, max_pings, max_concurrency, resol
     def one(filename):
         try:
             if operation == "grid":
-                tif = pyall.depthtotif(filename, resolution, value, colour, epsg, "", False,
+                tif = qcall.depthtotif(filename, resolution, value, colour, epsg, "", False,
                                        max_pings, False, odir, colour_min, colour_max, keep_rejected)
                 return {'input_file': filename, 'geotiff': tif, 'error': None}
             params = _runtime_params(epsg, odir, max_pings, False)
@@ -614,7 +635,7 @@ def _batch_run(matches, operation, odir, epsg, max_pings, max_concurrency, resol
         for fut in as_completed(futures):
             results.append(fut.result())
             done += 1
-            pyall._emitprogress(done / total, "processed %d/%d files" % (done, total))
+            qcall._emitprogress(done / total, "processed %d/%d files" % (done, total))
 
     succeeded = sum(1 for r in results if r.get('error') is None)
     return {
@@ -746,14 +767,14 @@ async def get_server_info() -> dict:
     """
     toolnames = sorted(t.name for t in await mcp.list_tools())
     return {
-        'server': 'pyall',
+        'server': 'qcall',
         'version': __version__,
         'author': __author__,
         'monitor_path': MONITOR_BASE,
         'monitor_url': _monitor_url(),
         'upload_endpoint': 'PUT/POST /upload/<filename.all>[?output_dir=&overwrite=true]',
         'download_endpoint': 'GET /download/<root-relative-path>',
-        'status_file': os.path.join(pyall.logdirectory(), pyall.STATUSFILENAME),
+        'status_file': os.path.join(qcall.logdirectory(), qcall.STATUSFILENAME),
         'log_file': LOGPATH,
         'async_tools': list(_ASYNC_TOOLS),
         'job_tools': ['get_job_status', 'list_jobs'],
@@ -988,6 +1009,11 @@ async def copy_file(source_path: str, output_dir: str = "", new_name: str = "",
     if os.path.exists(dest) and not overwrite:
         raise ValueError("Destination already exists: %s (set overwrite=true)." % dest)
 
+    srcsize = os.path.getsize(src) if os.path.exists(src) else 0
+    logging.info("copy_file -> %s (%s, %d bytes)", dest, src, srcsize)
+    qcall.writestatus(destdir, state='processing', job='Copying file', file=name,
+                      message="%s -> %s" % (src, dest))
+
     def _copy():
         parent = os.path.dirname(dest)
         if parent and not os.path.isdir(parent):
@@ -995,7 +1021,12 @@ async def copy_file(source_path: str, output_dir: str = "", new_name: str = "",
         shutil.copy2(src, dest)
         return os.path.getsize(dest)
 
+    start = time.time()
     size = await _to_thread(_copy)
+    elapsed = time.time() - start
+    logging.info("copy_file <- %s (%d bytes in %.3fs)", dest, size, elapsed)
+    qcall.writestatus(destdir, state='done', job='Copying file', file=name, elapsed=elapsed,
+                      message="copied %d bytes to %s" % (size, dest))
     return {'source': src, 'path': dest, 'filename': name, 'size': size}
 
 
@@ -1109,7 +1140,7 @@ async def get_positions(input_file: str, max_records: int = 5000) -> dict:
         max_records: Maximum number of records to return (0 = all).
     """
     _require_file(input_file)
-    recs = await _to_thread(pyall.loadpositions, input_file)
+    recs = await _to_thread(qcall.loadpositions, input_file)
     data, total, truncated = _limit(recs, max_records)
     return {'input_file': input_file, 'count': total, 'truncated': truncated, 'positions': data}
 
@@ -1124,7 +1155,7 @@ async def get_attitude(input_file: str, max_records: int = 5000) -> dict:
         max_records: Maximum number of rows to return (0 = all).
     """
     _require_file(input_file)
-    arr = await _to_thread(pyall.loadattitude, input_file)
+    arr = await _to_thread(qcall.loadattitude, input_file)
     total = int(arr.shape[0])
     rows = arr.tolist()
     truncated = False
@@ -1155,7 +1186,7 @@ async def get_significantwaveheight(input_file: str) -> dict:
         input_file: Absolute path to the .all file.
     """
     _require_file(input_file)
-    result = await _to_thread(pyall.significantattitude, input_file)
+    result = await _to_thread(qcall.significantattitude, input_file)
     result['input_file'] = input_file
     return result
 
@@ -1173,7 +1204,7 @@ async def get_network_attitude(input_file: str, max_records: int = 5000) -> dict
         max_records: Maximum number of rows to return (0 = all).
     """
     _require_file(input_file)
-    arr = await _to_thread(pyall.loadnetworkattitude, input_file)
+    arr = await _to_thread(qcall.loadnetworkattitude, input_file)
     total = int(arr.shape[0])
     rows = arr.tolist()
     truncated = False
@@ -1199,7 +1230,7 @@ async def get_clock(input_file: str, max_records: int = 5000) -> dict:
         max_records: Maximum number of records to return (0 = all).
     """
     _require_file(input_file)
-    recs = await _to_thread(pyall.loadclock, input_file)
+    recs = await _to_thread(qcall.loadclock, input_file)
     data, total, truncated = _limit(recs, max_records)
     return {'input_file': input_file, 'count': total, 'truncated': truncated, 'clock': data}
 
@@ -1214,7 +1245,7 @@ async def get_height(input_file: str, max_records: int = 5000) -> dict:
         max_records: Maximum number of records to return (0 = all).
     """
     _require_file(input_file)
-    recs = await _to_thread(pyall.loadheight, input_file)
+    recs = await _to_thread(qcall.loadheight, input_file)
     data, total, truncated = _limit(recs, max_records)
     return {'input_file': input_file, 'count': total, 'truncated': truncated, 'height': data}
 
@@ -1228,7 +1259,7 @@ async def get_sound_velocity_profiles(input_file: str) -> dict:
         input_file: Absolute path to the .all file.
     """
     _require_file(input_file)
-    recs = await _to_thread(pyall.loadsoundvelocityprofiles, input_file)
+    recs = await _to_thread(qcall.loadsoundvelocityprofiles, input_file)
     return {'input_file': input_file, 'count': len(recs), 'profiles': recs}
 
 
@@ -1241,7 +1272,7 @@ async def get_surface_sound_speed(input_file: str) -> dict:
         input_file: Absolute path to the .all file.
     """
     _require_file(input_file)
-    recs = await _to_thread(pyall.loadsurfacesoundspeed, input_file)
+    recs = await _to_thread(qcall.loadsurfacesoundspeed, input_file)
     return {'input_file': input_file, 'count': len(recs), 'surfacesoundspeed': recs}
 
 
@@ -1254,7 +1285,7 @@ async def get_runtime_parameters(input_file: str) -> dict:
         input_file: Absolute path to the .all file.
     """
     _require_file(input_file)
-    recs = await _to_thread(pyall.loadruntimeparameters, input_file)
+    recs = await _to_thread(qcall.loadruntimeparameters, input_file)
     return {'input_file': input_file, 'count': len(recs), 'runtimeparameters': recs}
 
 
@@ -1269,7 +1300,7 @@ async def get_travel_time(input_file: str, max_records: int = 200) -> dict:
         max_records: Maximum number of records to return (0 = all).
     """
     _require_file(input_file)
-    recs = await _to_thread(pyall.loadtraveltime, input_file, max_records)
+    recs = await _to_thread(qcall.loadtraveltime, input_file, max_records)
     return {'input_file': input_file, 'count': len(recs), 'traveltime': recs}
 
 
@@ -1282,7 +1313,7 @@ async def get_installation_parameters(input_file: str) -> dict:
         input_file: Absolute path to the .all file.
     """
     _require_file(input_file)
-    info = await _to_thread(pyall.loadinstallationparameters, input_file)
+    info = await _to_thread(qcall.loadinstallationparameters, input_file)
     return {'input_file': input_file, 'installation': info}
 
 
@@ -1304,7 +1335,7 @@ async def get_depth(input_file: str, max_pings: int = 50, max_points: int = 2000
         format: "csv" (default, compact single string) or "columns" (one list per field).
     """
     _require_file(input_file)
-    d = await _to_thread(pyall.loaddepth, input_file, max_pings)
+    d = await _to_thread(qcall.loaddepth, input_file, max_pings)
     total = int(d['depth'].shape[0])
     n = total
     truncated = False
@@ -1363,7 +1394,7 @@ async def get_depth_stats(input_file: str, max_pings: int = -1, bins: int = 20) 
         bins: Number of histogram bins for the depth distribution (default 20).
     """
     _require_file(input_file)
-    d = await _to_thread(pyall.loaddepth, input_file, max_pings)
+    d = await _to_thread(qcall.loaddepth, input_file, max_pings)
 
     def _summary(a):
         a = a[np.isfinite(a)]
@@ -1416,7 +1447,7 @@ async def get_seabed_image(input_file: str, max_pings: int = 50, max_samples: in
         max_samples: Maximum number of samples to return (0 = all read).
     """
     _require_file(input_file)
-    d = await _to_thread(pyall.loadseabedimage, input_file, max_pings)
+    d = await _to_thread(qcall.loadseabedimage, input_file, max_pings)
     total = int(d['samples'].shape[0])
     n = total
     truncated = False
@@ -1446,20 +1477,20 @@ async def get_pu_status(input_file: str, max_records: int = 5000) -> dict:
         max_records: Maximum number of records to return (0 = all).
     """
     _require_file(input_file)
-    recs = await _to_thread(pyall.loadpustatus, input_file)
+    recs = await _to_thread(qcall.loadpustatus, input_file)
     data, total, truncated = _limit(recs, max_records)
     return {'input_file': input_file, 'count': total, 'truncated': truncated, 'pustatus': data}
 
 
 ###############################################################################
 def _parse_args(argv):
-    '''parse command line arguments, falling back to PYALL_MCP_* environment variables.'''
+    '''parse command line arguments, falling back to QCALL_MCP_* environment variables.'''
     parser = argparse.ArgumentParser(
-        description="pyall MCP server - exposes Kongsberg .all processing tools to MCP clients.",
+        description="qc.all MCP server - exposes Kongsberg .all processing tools to MCP clients.",
     )
     parser.add_argument(
         "--transport", choices=["stdio", "http", "streamable-http", "sse"],
-        default=os.environ.get("PYALL_MCP_TRANSPORT", "stdio"),
+        default=os.environ.get("QCALL_MCP_TRANSPORT", "stdio"),
         help="Transport to use. 'stdio' (default) for a local client; 'http' (alias of "
              "'streamable-http') or 'sse' to serve over the network.",
     )
@@ -1468,19 +1499,19 @@ def _parse_args(argv):
         help="Shorthand for --transport http (serve over HTTP).",
     )
     parser.add_argument(
-        "--host", default=os.environ.get("PYALL_MCP_HOST", "127.0.0.1"),
+        "--host", default=os.environ.get("QCALL_MCP_HOST", "127.0.0.1"),
         help="Host/interface to bind when serving over HTTP. Use 0.0.0.0 to accept "
              "connections from other machines on the office network (default 127.0.0.1).",
     )
     parser.add_argument(
-        "--port", type=int, default=int(os.environ.get("PYALL_MCP_PORT", "8000")),
+        "--port", type=int, default=int(os.environ.get("QCALL_MCP_PORT", "8000")),
         help="TCP port to listen on when serving over HTTP (default 8000).",
     )
     parser.add_argument(
         "--root", action="append", default=None,
         help="Folder the file system tools and all path arguments are confined to. May be "
              "repeated. Strongly recommended when serving over HTTP. Defaults to the "
-             "PYALL_MCP_ROOT environment variable (os.pathsep separated) if set.",
+             "QCALL_MCP_ROOT environment variable (os.pathsep separated) if set.",
     )
     args = parser.parse_args(argv)
 
@@ -1490,7 +1521,7 @@ def _parse_args(argv):
         args.transport = "streamable-http"
 
     if args.root is None:
-        env_roots = os.environ.get("PYALL_MCP_ROOT", "")
+        env_roots = os.environ.get("QCALL_MCP_ROOT", "")
         args.root = [r for r in env_roots.split(os.pathsep) if r] if env_roots else []
 
     return args
@@ -1503,13 +1534,24 @@ if __name__ == "__main__":
     args = _parse_args(sys.argv[1:])
     roots = _set_allowed_roots(args.root)
 
+    # TEST: the stdio transport can be disabled with the DISABLE_STDIO flag above so
+    # only the HTTP instance runs.  Refuse to start (rather than silently switching).
+    if DISABLE_STDIO and args.transport == "stdio":
+        print("qc.all MCP server: stdio transport is disabled (DISABLE_STDIO=True).",
+              file=sys.stderr)
+        print("Start it over HTTP instead, e.g. --http (or set DISABLE_STDIO=False).",
+              file=sys.stderr)
+        sys.stderr.flush()
+        logging.warning("startup refused: stdio transport disabled (DISABLE_STDIO=True)")
+        sys.exit(2)
+
     # All human readable startup output goes to stderr so it never corrupts the
     # stdio MCP protocol (which talks over stdout).
     toolnames = sorted(t.name for t in asyncio.run(mcp.list_tools()))
 
     # record a useful startup summary in the shared rotating log
     logging.info("=" * 70)
-    logging.info("pyall MCP server starting")
+    logging.info("qc.all MCP server starting")
     logging.info("version       : %s", __version__)
     logging.info("author        : %s", __author__)
     logging.info("start date    : %s", time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1530,7 +1572,7 @@ if __name__ == "__main__":
     logging.info("=" * 70)
 
     if args.transport == "stdio":
-        print("pyall MCP server starting (stdio transport).", file=sys.stderr)
+        print("qc.all MCP server starting (stdio transport).", file=sys.stderr)
         print("It does not open a port or a URL - it talks to an MCP client over stdin/stdout.", file=sys.stderr)
     else:
         mcp.settings.host = args.host
@@ -1544,7 +1586,7 @@ if __name__ == "__main__":
             args.host, args.port,
             mcp.settings.sse_path if args.transport == "sse" else mcp.settings.streamable_http_path,
         )
-        print("pyall MCP server starting (%s transport)." % args.transport, file=sys.stderr)
+        print("qc.all MCP server starting (%s transport)." % args.transport, file=sys.stderr)
         print("Listening on %s" % url, file=sys.stderr)
         monitor_url = "http://%s:%d%s" % (args.host, args.port, MONITOR_BASE)
         print("Monitor web page: %s" % monitor_url, file=sys.stderr)

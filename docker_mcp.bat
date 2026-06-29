@@ -1,6 +1,6 @@
 @echo off
 rem ==========================================================================
-rem  docker_mcp.bat - build and run the pyall MCP server Docker container
+rem  docker_mcp.bat - build and run the qc.all MCP server Docker container
 rem
 rem  Usage:
 rem      docker_mcp.bat                build the image, then run it
@@ -23,8 +23,8 @@ rem  NAME  : the running container name.
 rem  PORT  : host port published to the container's port 8000.
 rem  DATA  : host folder mounted at /data (the server is confined to this).
 rem          Change it to your survey data folder. Append :ro to mount read-only.
-set "IMAGE=pyall-mcp"
-set "NAME=pyall-mcp"
+set "IMAGE=qcall-mcp"
+set "NAME=qcall-mcp"
 set "PORT=8000"
 set "DATA=%ROOT%sample"
 rem --------------------------------------------------------------------------

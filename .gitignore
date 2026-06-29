@@ -148,7 +148,10 @@ $RECYCLE.BIN/
 >>>>>>> origin/master
 sample/**
 
-# pyall runtime logs and status (shared rotating log folder)
+# qc.all runtime logs and status (shared rotating log folder)
 logs/
-pyall_status.json
+qcall_status.json
+
+# persistent Angular Varied Gain (AVG) store accumulated during backscatter gridding
+avgcache/
 
